@@ -11,7 +11,7 @@ use tauri::{Emitter, Manager};
 
 use db::Database;
 use models::{
-    Candidate, ClipLayout, EnvironmentStatus, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
+    Candidate, ClipLayout, EnvironmentStatus, LoudnessSpike, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
     Transcript, TranscriptWord,
 };
 
@@ -439,6 +439,14 @@ async fn generate_candidates(
     let normalized: NormalizedTranscript =
         serde_json::from_str(&transcript.raw_json).map_err(to_command_error)?;
 
+    // Loudness spikes (screams, laughter, crashes) are a key signal for gaming clips.
+    // Measuring is best-effort: if it fails, moment detection runs on the transcript alone.
+    let project = db.get_project(&project_id).map_err(to_command_error)?;
+    let cache_path = project_dir(&state, &project_id).join("loudness_spikes.json");
+    let spikes = tokio::task::spawn_blocking(move || loudness_spikes_cached(&project.source_path, &cache_path))
+        .await
+        .unwrap_or_default();
+
     let active_provider = provider
         .or_else(|| std::env::var("LLM_PROVIDER").ok())
         .unwrap_or_else(|| "deepseek".to_string())
@@ -449,7 +457,7 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                 .ok_or_else(|| "Set ANTHROPIC_API_KEY or supply Claude API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_claude(&normalized, &key)
+            llm::detect_candidates_with_claude(&normalized, &spikes, &key)
                 .await
                 .map_err(to_command_error)?
         }
@@ -457,7 +465,7 @@ async fn generate_candidates(
             let model = model_name
                 .or_else(|| std::env::var("OLLAMA_MODEL").ok())
                 .unwrap_or_else(|| "llama3.2".to_string());
-            llm::detect_candidates_with_local_llm(&normalized, &model)
+            llm::detect_candidates_with_local_llm(&normalized, &spikes, &model)
                 .await
                 .map_err(to_command_error)?
         }
@@ -465,7 +473,7 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                 .ok_or_else(|| "Set GEMINI_API_KEY or supply Gemini API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_gemini(&normalized, &key)
+            llm::detect_candidates_with_gemini(&normalized, &spikes, &key)
                 .await
                 .map_err(to_command_error)?
         }
@@ -473,7 +481,7 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .ok_or_else(|| "Set OPENAI_API_KEY or supply OpenAI API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_openai(&normalized, &key)
+            llm::detect_candidates_with_openai(&normalized, &spikes, &key)
                 .await
                 .map_err(to_command_error)?
         }
@@ -481,7 +489,7 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .ok_or_else(|| "Set OPENROUTER_API_KEY or supply OpenRouter API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_openrouter(&normalized, &key, model_name.as_deref())
+            llm::detect_candidates_with_openrouter(&normalized, &spikes, &key, model_name.as_deref())
                 .await
                 .map_err(to_command_error)?
         }
@@ -489,7 +497,7 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("GROQ_API_KEY").ok())
                 .ok_or_else(|| "Set GROQ_API_KEY or supply Groq API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_groq(&normalized, &key)
+            llm::detect_candidates_with_groq(&normalized, &spikes, &key)
                 .await
                 .map_err(to_command_error)?
         }
@@ -497,7 +505,7 @@ async fn generate_candidates(
             let key = api_key
                 .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
                 .ok_or_else(|| "Set DEEPSEEK_API_KEY or supply DeepSeek API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_deepseek(&normalized, &key, model_name.as_deref())
+            llm::detect_candidates_with_deepseek(&normalized, &spikes, &key, model_name.as_deref())
                 .await
                 .map_err(to_command_error)?
         }
@@ -812,6 +820,32 @@ async fn download_youtube_video(url: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Loudness spikes for a source file, measured once and then read from `cache_path`.
+fn loudness_spikes_cached(source_path: &str, cache_path: &std::path::Path) -> Vec<LoudnessSpike> {
+    if let Some(cached) = std::fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<Vec<LoudnessSpike>>(&json).ok())
+    {
+        return cached;
+    }
+    match media::loudness_per_second(source_path) {
+        Ok(levels) => {
+            let spikes = media::find_loudness_spikes(&levels);
+            if let Some(dir) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(json) = serde_json::to_string(&spikes) {
+                let _ = std::fs::write(cache_path, json);
+            }
+            spikes
+        }
+        Err(error) => {
+            eprintln!("loudness analysis skipped: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn project_dir(state: &AppState, project_id: &str) -> PathBuf {

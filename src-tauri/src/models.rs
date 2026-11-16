@@ -170,3 +170,18 @@ pub struct CandidateDraft {
     pub hook: String,
     pub rationale: String,
 }
+
+/// A stretch of audio that is much louder than the stream around it
+/// (screams, laughter, explosions, crashes).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LoudnessSpike {
+    pub start: f64,
+    pub end: f64,
+    /// Second with the highest level inside the spike.
+    pub peak_sec: f64,
+    /// RMS level of that second, in dBFS.
+    pub peak_db: f64,
+    /// How far the peak sits above the local baseline, in dB.
+    pub excess_db: f64,
+}

@@ -6,7 +6,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
-use crate::models::{ClipLayout, MediaProbe, NormRect};
+use crate::models::{ClipLayout, LoudnessSpike, MediaProbe, NormRect};
 
 pub fn command_exists(name: &str) -> bool {
     Command::new(name).arg("-version").output().is_ok()
@@ -315,6 +315,127 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Sample rate used for loudness analysis. Plenty for level measurement and cheap to decode.
+const LOUDNESS_SAMPLE_RATE: usize = 8000;
+/// Quietest level treated as a potential reaction (dBFS). Filters spikes out of near-silence.
+const SPIKE_FLOOR_DB: f32 = -35.0;
+/// How far above the local baseline a second must be to count as a spike.
+const SPIKE_THRESHOLD_DB: f32 = 8.0;
+/// Baseline window: the median level over this many seconds either side.
+const BASELINE_HALF_WINDOW: usize = 60;
+
+/// Decodes the audio track and returns its RMS level (dBFS) for every second.
+/// Streams the PCM from FFmpeg, so a 6-hour VOD never has to sit in memory.
+pub fn loudness_per_second(source_path: &str) -> Result<Vec<f32>> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    if !command_exists("ffmpeg") {
+        return Err(anyhow!("ffmpeg is not installed or not available on PATH"));
+    }
+    let rate = LOUDNESS_SAMPLE_RATE.to_string();
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-i", source_path, "-vn", "-ac", "1", "-ar", &rate])
+        .args(["-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting ffmpeg loudness analysis")?;
+    let mut stdout = child.stdout.take().context("capturing ffmpeg output")?;
+
+    let mut levels = Vec::new();
+    let mut buf = vec![0u8; LOUDNESS_SAMPLE_RATE * 2];
+    let (mut sum_sq, mut count, mut carry) = (0f64, 0usize, None::<u8>);
+    loop {
+        let read = stdout.read(&mut buf).context("reading ffmpeg audio")?;
+        if read == 0 {
+            break;
+        }
+        let mut bytes = buf[..read].iter().copied();
+        loop {
+            let lo = match carry.take().or_else(|| bytes.next()) {
+                Some(b) => b,
+                None => break,
+            };
+            let hi = match bytes.next() {
+                Some(b) => b,
+                None => {
+                    carry = Some(lo);
+                    break;
+                }
+            };
+            let sample = i16::from_le_bytes([lo, hi]) as f64 / 32768.0;
+            sum_sq += sample * sample;
+            count += 1;
+            if count == LOUDNESS_SAMPLE_RATE {
+                levels.push(rms_db(sum_sq, count));
+                sum_sq = 0.0;
+                count = 0;
+            }
+        }
+    }
+    if count > LOUDNESS_SAMPLE_RATE / 4 {
+        levels.push(rms_db(sum_sq, count));
+    }
+    let status = child.wait().context("waiting for ffmpeg")?;
+    if !status.success() && levels.is_empty() {
+        return Err(anyhow!("ffmpeg could not decode the audio for loudness analysis"));
+    }
+    Ok(levels)
+}
+
+fn rms_db(sum_sq: f64, count: usize) -> f32 {
+    let rms = (sum_sq / count.max(1) as f64).sqrt();
+    (20.0 * rms.max(1e-6).log10()) as f32
+}
+
+/// Finds moments that are much louder than the stream around them.
+///
+/// Each second is compared with the median of the surrounding two minutes, so a loud
+/// game section doesn't drown out reactions, and quiet talk doesn't count as a spike.
+/// Neighbouring loud seconds (gaps up to 2 s) merge into one spike.
+pub fn find_loudness_spikes(levels: &[f32]) -> Vec<LoudnessSpike> {
+    let n = levels.len();
+    let mut spikes: Vec<LoudnessSpike> = Vec::new();
+    let mut window: Vec<f32> = Vec::with_capacity(BASELINE_HALF_WINDOW * 2 + 1);
+
+    for (i, &level) in levels.iter().enumerate() {
+        if level < SPIKE_FLOOR_DB {
+            continue;
+        }
+        let lo = i.saturating_sub(BASELINE_HALF_WINDOW);
+        let hi = (i + BASELINE_HALF_WINDOW + 1).min(n);
+        window.clear();
+        window.extend_from_slice(&levels[lo..hi]);
+        window.sort_by(|a, b| a.total_cmp(b));
+        let baseline = window[window.len() / 2];
+        let excess = level - baseline;
+        if excess < SPIKE_THRESHOLD_DB {
+            continue;
+        }
+
+        let t = i as f64;
+        match spikes.last_mut() {
+            Some(last) if t - last.end <= 2.0 => {
+                last.end = t + 1.0;
+                if excess as f64 > last.excess_db {
+                    last.excess_db = excess as f64;
+                    last.peak_db = level as f64;
+                    last.peak_sec = t;
+                }
+            }
+            _ => spikes.push(LoudnessSpike {
+                start: t,
+                end: t + 1.0,
+                peak_sec: t,
+                peak_db: level as f64,
+                excess_db: excess as f64,
+            }),
+        }
+    }
+    spikes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +493,52 @@ mod tests {
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn loudness_spikes_are_relative_to_local_baseline() {
+        // 10 minutes of steady talk at -30 dB, a scream at 5:00, and a loud but steady
+        // game section from 7:00 onwards that should NOT count as a spike.
+        let mut levels = vec![-30.0f32; 600];
+        for l in levels.iter_mut().skip(420) {
+            *l = -14.0;
+        }
+        levels[300] = -12.0;
+        levels[301] = -10.0;
+        levels[303] = -13.0; // within the 2 s gap, merges with the first two
+        let spikes = find_loudness_spikes(&levels);
+        assert_eq!(spikes.len(), 1, "{spikes:?}");
+        let s = spikes[0];
+        assert_eq!((s.start, s.end, s.peak_sec), (300.0, 304.0, 301.0));
+        assert!((s.excess_db - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn quiet_streams_produce_no_spikes() {
+        let mut levels = vec![-60.0f32; 300];
+        levels[100] = -45.0; // 15 dB jump, but still below the floor
+        assert!(find_loudness_spikes(&levels).is_empty());
+    }
+
+    #[test]
+    fn loudness_of_a_real_file_is_measured_per_second() {
+        if !command_exists("ffmpeg") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("autoshorts-loud-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        // 3 s quiet tone, 1 s loud tone, 3 s quiet tone.
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=300:duration=7,volume='if(between(t,3,4),1,0.05)':eval=frame")
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let levels = loudness_per_second(wav.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(levels.len(), 7, "{levels:?}");
+        assert!(levels[3] - levels[1] > 20.0, "{levels:?}");
     }
 }

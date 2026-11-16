@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::models::{CandidateDraft, NormalizedTranscript, TranscriptSegment};
+use crate::models::{CandidateDraft, LoudnessSpike, NormalizedTranscript, TranscriptSegment};
 
 #[derive(Debug, Deserialize)]
 struct AnthropicMessage {
@@ -32,22 +32,11 @@ struct DeepseekResponse {
 
 pub async fn detect_candidates_with_deepseek(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     api_key: &str,
     model_name: Option<&str>,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
+    let prompt = build_prompt(transcript, spikes);
 
     let default_model = "deepseek-chat".to_string();
     let model = model_name
@@ -89,12 +78,7 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("DeepSeek response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    finish_candidates(&text, transcript, spikes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,21 +103,10 @@ struct GeminiPart {
 
 pub async fn detect_candidates_with_gemini(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     api_key: &str,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
+    let prompt = build_prompt(transcript, spikes);
 
     let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
     let url = format!(
@@ -176,12 +149,7 @@ Transcript:
         .and_then(|p| p.text.clone())
         .ok_or_else(|| anyhow!("Gemini response did not include content text"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    finish_candidates(&text, transcript, spikes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,21 +169,10 @@ struct ChatCompletionMessage {
 
 pub async fn detect_candidates_with_openai(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     api_key: &str,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
+    let prompt = build_prompt(transcript, spikes);
 
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
@@ -253,32 +210,16 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("OpenAI response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    finish_candidates(&text, transcript, spikes)
 }
 
 pub async fn detect_candidates_with_openrouter(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     api_key: &str,
     model_name: Option<&str>,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
+    let prompt = build_prompt(transcript, spikes);
 
     let default_model = "google/gemini-2.5-flash".to_string();
     let model = model_name
@@ -323,31 +264,15 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("OpenRouter response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    finish_candidates(&text, transcript, spikes)
 }
 
 pub async fn detect_candidates_with_groq(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     api_key: &str,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
+    let prompt = build_prompt(transcript, spikes);
 
     let model =
         std::env::var("GROQ_MODEL").unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
@@ -388,12 +313,7 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("Groq response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    finish_candidates(&text, transcript, spikes)
 }
 
 #[derive(Debug, Serialize)]
@@ -404,21 +324,10 @@ struct ClaudeMessage<'a> {
 
 pub async fn detect_candidates_with_claude(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     api_key: &str,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
+    let prompt = build_prompt(transcript, spikes);
 
     let model =
         std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string());
@@ -429,7 +338,7 @@ Transcript:
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
             "model": model,
-            "max_tokens": 1800,
+            "max_tokens": 4096,
             "temperature": 0.2,
             "messages": [
                 ClaudeMessage {
@@ -455,12 +364,7 @@ Transcript:
         .find_map(|content| content.text)
         .ok_or_else(|| anyhow!("Claude response did not include text content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    finish_candidates(&text, transcript, spikes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,21 +379,16 @@ struct OllamaResponse {
 
 pub async fn detect_candidates_with_local_llm(
     transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
     model_name: &str,
 ) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-
-    let system_instructions = "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-CRITICAL: Each clip candidate MUST have a duration between 30 and 90 seconds (i.e. 'end' minus 'start' must be between 30.0 and 90.0). \
-Do NOT return short clips of less than 30 seconds. Combine multiple adjacent sentences to build a meaningful segment of 30-90 seconds. \
-Favor highly shareable content: concrete stories, strong opinions, emotional turns, surprising or counter-intuitive claims, clear payoffs, and high-energy/dramatic peaks. \
-You MUST identify and return at least 3-10 candidates. Do not return an empty candidates list. \
-Ensure the 'start' and 'end' values correspond to actual timestamps in the transcript. Do not output 0.0 for start and end times.";
-
-    let user_content = format!("Transcript:\n{}", segments);
+    let system_instructions = format!(
+        "{MOMENT_INSTRUCTIONS}\n\n\
+REMINDERS FOR THIS MODEL: Each clip MUST last between 20 and 60 seconds (end minus start). \
+Combine adjacent transcript lines to reach that length. Return at least 3 candidates; never an empty list. \
+start and end must be real timestamps from the transcript, never 0.0 for both."
+    );
+    let user_content = moment_input(transcript, spikes);
 
     let response = reqwest::Client::new()
         .post("http://localhost:11434/api/chat")
@@ -544,22 +443,161 @@ Ensure the 'start' and 'end' values correspond to actual timestamps in the trans
         .json()
         .await
         .context("parsing local Ollama response")?;
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&res_body.message.content, min_duration)
+    finish_candidates(&res_body.message.content, transcript, spikes)
 }
 
-fn compact_segments(segments: &[TranscriptSegment]) -> String {
+/// Instructions shared by every provider: what a great GTA 6 stream clip is and how to cut it.
+const MOMENT_INSTRUCTIONS: &str = "You are the clip editor for a GTA 6 livestream channel. \
+Find the moments in this stream that would go viral as TikTok / YouTube Shorts gaming clips.
+
+WHAT MAKES A GREAT CLIP, in priority order:
+1. Big streamer reactions: screaming, yelling, losing it laughing, stunned silence then an outburst, rage.
+2. Police chases and wanted-level chaos: escapes, close calls, getting busted at the last second.
+3. Crashes and wipeouts: spectacular car, bike, boat or plane crashes, ragdoll physics.
+4. Fails: botched heists or missions, dumb deaths, plans going wrong, falling off things.
+5. Funny NPC moments: NPCs saying or doing something absurd, strange AI behaviour, glitches.
+6. First-look reveals: the streamer seeing a new place, vehicle, character, mechanic or story beat for the first time and reacting to it.
+Skip: menus, loading screens, uneventful driving, reading chat, sponsor reads, tech problems, long calm talk.
+
+USING THE AUDIO:
+The best moments are often reactions rather than words, and speech-to-text misses screams and laughter. You get two audio signals:
+- LOUDNESS SPIKES: seconds where the audio is far louder than the surrounding two minutes. Usually the streamer screaming or laughing, or a crash, explosion or gunfire in the game. More dB means a bigger moment.
+- Transcript lines that overlap a spike are tagged <LOUD +NdB>.
+Treat a spike as strong evidence of a moment, especially together with exclamations in the transcript \
+(\"no no no\", \"oh my god\", \"bro\", \"what\", \"let's go\", swearing, laughter, repeated words). \
+A spike with little or no transcript around it is often a pure reaction or game event and can still be a clip. \
+Not every spike is a moment (music, an alert sound, one gunshot in routine play): use the transcript to judge.
+
+HOW TO CUT:
+- 20 to 60 seconds per clip.
+- Start 5 to 15 seconds BEFORE the peak so viewers see the setup (the chase starting, the car speeding up, the NPC walking over). End shortly after the reaction dies down, not mid-sentence.
+- Clips must not overlap each other.
+- start and end are seconds and must be real times inside the stream, taken from the timestamps below.
+
+FOR EACH CLIP RETURN:
+- start, end: seconds.
+- score: 0.0 to 1.0, how likely the clip is to go viral. Reward reaction intensity, a clear payoff and spike size. Be honest: most clips are not 0.9+.
+- hook: a short on-screen title in TikTok style, at most 60 characters, that stops the scroll \
+(for example \"He did NOT see that cop coming\" or \"GTA 6 NPCs are unhinged\"). No emojis, no hashtags.
+- rationale: start with one category tag: [REACTION], [POLICE CHASE], [CRASH], [FAIL], [NPC], [FIRST LOOK] or [OTHER]; \
+then one sentence on what happens and why it works.
+
+Return up to 15 clips, best first, as JSON in exactly this shape:
+{\"candidates\":[{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}]}";
+
+/// How many spikes are listed in the prompt (the strongest ones).
+const MAX_PROMPT_SPIKES: usize = 60;
+/// Largest score bonus a clip gets for containing a big loudness spike.
+const LOUDNESS_BONUS: f64 = 0.1;
+/// Spike size (dB above baseline) that earns the full bonus.
+const FULL_BONUS_EXCESS_DB: f64 = 20.0;
+/// Shortest clip kept from a long stream.
+const MIN_CLIP_SECONDS: f64 = 15.0;
+/// Most clips kept per analysis.
+const MAX_CANDIDATES: usize = 10;
+
+fn build_prompt(transcript: &NormalizedTranscript, spikes: &[LoudnessSpike]) -> String {
+    format!("{MOMENT_INSTRUCTIONS}\n\n{}", moment_input(transcript, spikes))
+}
+
+fn format_clock(seconds: f64) -> String {
+    let s = seconds.max(0.0).round() as u64;
+    format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// The data part of the prompt: stream length, the loudest moments, and the tagged transcript.
+fn moment_input(transcript: &NormalizedTranscript, spikes: &[LoudnessSpike]) -> String {
+    let mut strongest: Vec<&LoudnessSpike> = spikes.iter().collect();
+    strongest.sort_by(|a, b| b.excess_db.total_cmp(&a.excess_db));
+    strongest.truncate(MAX_PROMPT_SPIKES);
+    strongest.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    let spike_lines = if strongest.is_empty() {
+        "None detected (no audio track, or the audio level stays steady).".to_string()
+    } else {
+        strongest
+            .iter()
+            .map(|s| {
+                format!(
+                    "- {:.1}-{:.1} s (peak at {:.1} s): +{:.1} dB",
+                    s.start, s.end, s.peak_sec, s.excess_db
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "STREAM LENGTH: {} ({:.0} seconds)\n\n\
+LOUDNESS SPIKES (strongest {} shown, in time order; dB above the local baseline):\n{}\n\n\
+TRANSCRIPT (timestamps in seconds):\n{}",
+        format_clock(transcript.duration),
+        transcript.duration,
+        strongest.len(),
+        spike_lines,
+        compact_segments(&transcript.segments, spikes)
+    )
+}
+
+/// Biggest spike (dB above baseline) that overlaps the given time range.
+fn loudest_overlap(spikes: &[LoudnessSpike], start: f64, end: f64) -> Option<f64> {
+    spikes
+        .iter()
+        .filter(|s| s.start < end && s.end > start)
+        .map(|s| s.excess_db)
+        .max_by(|a, b| a.total_cmp(b))
+}
+
+fn min_clip_duration(transcript: &NormalizedTranscript) -> f64 {
+    if transcript.duration < 60.0 {
+        (transcript.duration * 0.5).max(5.0)
+    } else {
+        MIN_CLIP_SECONDS
+    }
+}
+
+/// Parses the model's answer, then boosts clips containing big loudness spikes,
+/// drops clips that mostly repeat a better one, and keeps the best few.
+fn finish_candidates(
+    text: &str,
+    transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
+) -> Result<Vec<CandidateDraft>> {
+    let mut candidates = parse_candidate_json(text, min_clip_duration(transcript))?;
+    for c in candidates.iter_mut() {
+        if let Some(excess) = loudest_overlap(spikes, c.start, c.end) {
+            c.score = (c.score + LOUDNESS_BONUS * (excess / FULL_BONUS_EXCESS_DB).min(1.0)).min(1.0);
+        }
+    }
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    let mut kept: Vec<CandidateDraft> = Vec::new();
+    for c in candidates {
+        let duplicate = kept.iter().any(|k| {
+            let overlap = (c.end.min(k.end) - c.start.max(k.start)).max(0.0);
+            overlap > 0.5 * (c.end - c.start).min(k.end - k.start)
+        });
+        if !duplicate {
+            kept.push(c);
+        }
+        if kept.len() == MAX_CANDIDATES {
+            break;
+        }
+    }
+    Ok(kept)
+}
+
+fn compact_segments(segments: &[TranscriptSegment], spikes: &[LoudnessSpike]) -> String {
     segments
         .iter()
         .map(|segment| {
             let speaker = segment.speaker.as_deref().unwrap_or("Speaker");
+            let loud = loudest_overlap(spikes, segment.start, segment.end)
+                .map(|db| format!(" <LOUD +{db:.0}dB>"))
+                .unwrap_or_default();
             format!(
-                "[{:.2}-{:.2}] {}: {}",
-                segment.start, segment.end, speaker, segment.text
+                "[{:.2}-{:.2}] {}: {}{}",
+                segment.start, segment.end, speaker, segment.text, loud
             )
         })
         .collect::<Vec<_>>()
@@ -716,7 +754,52 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
             .collect::<Vec<_>>();
     }
 
-    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
-    candidates.truncate(10);
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transcript(duration: f64) -> NormalizedTranscript {
+        NormalizedTranscript {
+            language: "en".into(),
+            duration,
+            speakers: vec![],
+            words: vec![],
+            segments: vec![
+                TranscriptSegment { start: 100.0, end: 104.0, speaker: None, text: "chilling".into() },
+                TranscriptSegment { start: 200.0, end: 203.5, speaker: None, text: "NO NO NO".into() },
+            ],
+        }
+    }
+
+    fn spike(start: f64, end: f64, excess_db: f64) -> LoudnessSpike {
+        LoudnessSpike { start, end, peak_sec: start, peak_db: -10.0, excess_db }
+    }
+
+    #[test]
+    fn prompt_lists_spikes_and_tags_loud_lines() {
+        let input = moment_input(&transcript(7300.0), &[spike(201.0, 203.0, 17.2)]);
+        assert!(input.contains("STREAM LENGTH: 2:01:40"));
+        assert!(input.contains("- 201.0-203.0 s (peak at 201.0 s): +17.2 dB"));
+        assert!(input.contains("[200.00-203.50] Speaker: NO NO NO <LOUD +17dB>"));
+        assert!(input.contains("[100.00-104.00] Speaker: chilling\n"));
+        let prompt = build_prompt(&transcript(7300.0), &[]);
+        assert!(prompt.contains("GTA 6") && prompt.contains("None detected"));
+    }
+
+    #[test]
+    fn loud_clips_are_boosted_and_overlapping_clips_dropped() {
+        let answer = r#"{"candidates":[
+            {"start":180,"end":220,"score":0.80,"hook":"chase","rationale":"[POLICE CHASE] x"},
+            {"start":185,"end":225,"score":0.70,"hook":"same chase","rationale":"[REACTION] x"},
+            {"start":400,"end":440,"score":0.85,"hook":"quiet","rationale":"[NPC] x"},
+            {"start":500,"end":505,"score":0.99,"hook":"too short","rationale":"[FAIL] x"}
+        ]}"#;
+        let out = finish_candidates(answer, &transcript(3600.0), &[spike(201.0, 203.0, 20.0)]).unwrap();
+        let hooks: Vec<&str> = out.iter().map(|c| c.hook.as_str()).collect();
+        assert_eq!(hooks, ["chase", "quiet"]);
+        assert!((out[0].score - 0.90).abs() < 1e-9);
+    }
 }
