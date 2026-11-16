@@ -1973,3 +1973,20 @@ button:disabled {
   background: var(--accent-primary);
   transition: width 0.3s ease;
 }
+
+/* Style preview: TikTok Gaming (heavy outline, loud word in yellow) */
+.preview-text-tiktok {
+  font-family: 'Arial Black', 'Segoe UI Black', 'Impact', sans-serif;
+  font-size: 17px;
+  font-weight: 900;
+  color: #ffffff;
+  letter-spacing: 0.5px;
+  -webkit-text-stroke: 1px #000;
+  paint-order: stroke fill;
+  text-shadow: 2px 2px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
+}
+
+.preview-text-tiktok em {
+  font-style: normal;
+  color: #ffe11a;
+}

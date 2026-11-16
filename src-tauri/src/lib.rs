@@ -711,13 +711,21 @@ async fn render_flat_clip_for_candidate(
                 if std::fs::write(&clip_srt_path, srt_content).is_ok() {
                     srt_path = Some(clip_srt_path);
                 }
-                let style = project.caption_style.as_deref().unwrap_or("modern-box");
+                let style = project.caption_style.as_deref().unwrap_or("tiktok");
+                // Loudness spikes saved by moment detection; used to highlight shouted words.
+                let spikes: Vec<LoudnessSpike> = std::fs::read_to_string(
+                    data_dir.join("projects").join(&project.id).join("loudness_spikes.json"),
+                )
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
                 let drawtext = build_drawtext_filters(
                     &normalized.words,
                     candidate.start_sec,
                     candidate.end_sec,
                     cropped_width,
                     style,
+                    &spikes,
                 );
                 if !drawtext.is_empty() {
                     drawtext_filters = Some(drawtext);
@@ -1131,150 +1139,158 @@ fn format_srt_time(start: f64, end: f64) -> String {
     format!("{} --> {}", format_time(start), format_time(end))
 }
 
+/// Heaviest font available for captions. Black/Impact-style weights read best on phones.
+fn caption_font_path() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut windows_dirs = vec!["C:/Windows/Fonts".to_string()];
+    if let Ok(windir) = std::env::var("WINDIR").or_else(|_| std::env::var("SystemRoot")) {
+        windows_dirs.insert(0, format!("{}/Fonts", windir.replace('\\', "/")));
+    }
+    for dir in &windows_dirs {
+        for file in ["seguibl.ttf", "ariblk.ttf", "impact.ttf", "segoeuib.ttf", "arialbd.ttf"] {
+            candidates.push(format!("{dir}/{file}"));
+        }
+    }
+    candidates.extend(
+        [
+            // macOS
+            "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+            "/System/Library/Fonts/Supplemental/Impact.ttf",
+            "/System/Library/Fonts/Supplemental/Futura.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            // Linux
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+        .map(String::from),
+    );
+    candidates.into_iter().find(|path| std::path::Path::new(path).exists())
+}
+
+/// Colors and decoration for one caption preset. Every preset uses the same
+/// word-by-word timing and size; presets only change the look.
+struct CaptionLook {
+    fill: &'static str,
+    /// Fill for words shouted during a loudness spike.
+    loud_fill: &'static str,
+    outline: bool,
+    shadow: bool,
+    box_color: Option<&'static str>,
+}
+
+fn caption_look(style: &str) -> CaptionLook {
+    let look = |fill, loud_fill, outline, shadow, box_color| CaptionLook { fill, loud_fill, outline, shadow, box_color };
+    match style {
+        "classic-outline" => look("0xFFE11A", "white", true, true, None),
+        "minimal-shadow" => look("white", "0xFFE11A", false, true, None),
+        "vibrant-cyan" => look("0x00FFFF", "white", true, true, None),
+        "vibrant-yellow-box" => look("black", "0xD10000", false, false, Some("0xFFE11A")),
+        "vibrant-green" => look("0x39FF14", "white", true, true, None),
+        "vibrant-red" => look("0xFF3B30", "white", true, true, None),
+        "modern-box" => look("white", "0xFFE11A", false, false, Some("0x000000@0.7")),
+        // "tiktok" and anything unknown: white with a heavy black outline, loud words in yellow.
+        _ => look("white", "0xFFE11A", true, true, None),
+    }
+}
+
+/// Caption text as drawn: upper case, letters/digits plus ! and ?, with apostrophes
+/// swapped for a typographic one (a plain ' would end the quoted FFmpeg argument).
+fn caption_text(word: &str) -> String {
+    word.to_uppercase()
+        .chars()
+        .filter_map(|c| match c {
+            '\'' | '’' => Some('’'),
+            c if c.is_alphanumeric() || c == '!' || c == '?' => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Caption size as a share of the frame width, before fitting long words.
+const CAPTION_SIZE_RATIO: f64 = 0.15;
+/// Loud words are drawn this much bigger.
+const CAPTION_LOUD_SCALE: f64 = 1.15;
+/// Pop-in: a word starts at this fraction of its size and grows to full size...
+const CAPTION_POP_FROM: f64 = 0.75;
+/// ...over this many seconds.
+const CAPTION_POP_SECS: f64 = 0.1;
+/// A word stays up until the next one starts, or at most this long after it is spoken.
+const CAPTION_HOLD_SECS: f64 = 0.5;
+
+/// Builds TikTok-style captions: one big word at a time, centered, popping in as it is
+/// spoken. Words said during a loudness spike (or ending in "!") are highlighted.
 fn build_drawtext_filters(
     words: &[TranscriptWord],
     start_sec: f64,
     end_sec: f64,
-    cropped_width: i64,
+    frame_width: i64,
     caption_style: &str,
+    spikes: &[LoudnessSpike],
 ) -> String {
+    let clip_len = end_sec - start_sec;
     let candidate_words: Vec<&TranscriptWord> = words
         .iter()
         .filter(|w| w.end > start_sec && w.start < end_sec)
         .collect();
-
-    if candidate_words.is_empty() {
+    if candidate_words.is_empty() || clip_len <= 0.0 {
         return String::new();
     }
 
-    // Build font option once for drawtext filter
-    let mut font_paths = vec![
-        // macOS
-        "/System/Library/Fonts/Supplemental/Futura.ttc".to_string(),
-        "/System/Library/Fonts/Avenir Next.ttc".to_string(),
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf".to_string(),
-        "/System/Library/Fonts/Helvetica.ttc".to_string(),
-        // Windows standard
-        "C:/Windows/Fonts/SegoeUIb.ttf".to_string(),
-        "C:/Windows/Fonts/segoeuib.ttf".to_string(),
-        "C:/Windows/Fonts/SegoeUI.ttf".to_string(),
-        "C:/Windows/Fonts/segoeui.ttf".to_string(),
-        "C:/Windows/Fonts/arialbd.ttf".to_string(),
-        "C:/Windows/Fonts/arial.ttf".to_string(),
-        // Linux
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".to_string(),
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf".to_string(),
-    ];
-    if let Ok(windir) = std::env::var("WINDIR").or_else(|_| std::env::var("SystemRoot")) {
-        let windir_fonts = format!("{}/Fonts", windir.replace('\\', "/"));
-        font_paths.push(format!("{}/SegoeUIb.ttf", windir_fonts));
-        font_paths.push(format!("{}/segoeuib.ttf", windir_fonts));
-        font_paths.push(format!("{}/SegoeUI.ttf", windir_fonts));
-        font_paths.push(format!("{}/arialbd.ttf", windir_fonts));
-        font_paths.push(format!("{}/arial.ttf", windir_fonts));
-    }
+    let font_option = caption_font_path()
+        .map(|path| format!("fontfile='{}':", path.replace('\\', "/").replace('\'', "'\\''")))
+        .unwrap_or_default();
+    let look = caption_look(caption_style);
+    let width = frame_width.max(100) as f64;
 
-    let mut font_option = String::new();
-    for path in &font_paths {
-        if std::path::Path::new(path).exists() {
-            let normalized_path = path.replace('\\', "/");
-            let escaped_path = normalized_path.replace('\'', "'\\''");
-            font_option = format!("fontfile='{}':", escaped_path);
-            break;
-        }
-    }
-
-    let mut drawtext_filters = Vec::new();
-
-    // Group into chunks of 2 words for fast-paced style captions
-    for chunk in candidate_words.chunks(2) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let first = chunk[0];
-        let last = chunk[chunk.len() - 1];
-
-        // Timestamps relative to clip start (due to fast input seeking resetting stream PTS)
-        let start_rel = (first.start - start_sec).max(0.0);
-        let end_rel = (last.end - start_sec).min(end_sec - start_sec).max(0.0);
-        if end_rel <= start_rel {
+    let mut filters = Vec::new();
+    for (i, word) in candidate_words.iter().enumerate() {
+        let text = caption_text(&word.text);
+        if text.is_empty() {
             continue;
         }
 
-        let text = chunk
-            .iter()
-            .map(|w| w.text.to_uppercase())
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Clip-relative times (input seeking restarts timestamps at 0).
+        let show = (word.start - start_sec).max(0.0);
+        let next_start = candidate_words.get(i + 1).map(|n| n.start - start_sec);
+        let natural_end = word.end - start_sec + CAPTION_HOLD_SECS;
+        let hide = next_start.map_or(natural_end, |n| n.min(natural_end)).min(clip_len);
+        if hide <= show {
+            continue;
+        }
 
-        // Clean text to avoid breaking filter parameters
-        let clean_text: String = text.chars()
-            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '!' || *c == '?')
-            .collect();
+        let mid = (word.start + word.end) / 2.0;
+        let loud = word.text.trim_end().ends_with('!')
+            || spikes.iter().any(|s| mid >= s.start && mid <= s.end);
 
-        // Responsive font size and padding box
-        let fontsize = ((cropped_width as f64) * 0.075).clamp(16.0, 80.0).round() as i64;
-        let padding = ((fontsize as f64) * 0.3).clamp(4.0, 24.0).round() as i64;
+        // Big, but long words shrink to fit the width (heavy fonts run ~0.75 em per capital).
+        let chars = text.chars().count().max(1) as f64;
+        let fitted = (width * 0.88 / (chars * 0.75)).min(width * CAPTION_SIZE_RATIO);
+        let size = (fitted * if loud { CAPTION_LOUD_SCALE } else { 1.0 })
+            .min(width * 0.88 / (chars * 0.75))
+            .max(width * 0.05)
+            .floor();
+        let fontsize = format!(
+            "{size:.0}*({CAPTION_POP_FROM}+{grow}*min(1,(t-{show:.3})/{CAPTION_POP_SECS}))",
+            grow = 1.0 - CAPTION_POP_FROM
+        );
 
+        let mut style = format!("fontcolor={}", if loud { look.loud_fill } else { look.fill });
+        if look.outline {
+            style.push_str(&format!(":borderw={:.0}:bordercolor=black", (size * 0.09).max(2.0)));
+        }
+        if look.shadow {
+            let offset = (size * 0.05).max(2.0);
+            style.push_str(&format!(":shadowcolor=black@0.6:shadowx={offset:.0}:shadowy={offset:.0}"));
+        }
+        if let Some(box_color) = look.box_color {
+            style.push_str(&format!(":box=1:boxcolor={box_color}:boxborderw={:.0}", (size * 0.25).max(4.0)));
+        }
 
-        let drawtext = match caption_style {
-            "classic-outline" => {
-                // Classic yellow text with a bold outline (CapCut style)
-                let borderw = ((fontsize as f64) * 0.1).clamp(2.0, 8.0).round() as i64;
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.65:fontsize={}:fontcolor=yellow:borderw={}:bordercolor=black:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, borderw, start_rel, end_rel
-                )
-            }
-            "minimal-shadow" => {
-                // Sleek white text with a soft drop shadow (Minimalist)
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.7:fontsize={}:fontcolor=white:shadowcolor=black@0.5:shadowx=2:shadowy=2:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, start_rel, end_rel
-                )
-            }
-            "vibrant-cyan" => {
-                // Modern Avenir Next look with clean cyan color and thin shadow
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.7:fontsize={}:fontcolor=0x00FFFF:shadowcolor=black@0.6:shadowx=2:shadowy=2:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, start_rel, end_rel
-                )
-            }
-            "vibrant-yellow-box" => {
-                // Vibrant black text inside a solid yellow background box (Motivational/TikTok style)
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.72:fontsize={}:fontcolor=black:box=1:boxcolor=0xffff00e0:boxborderw={}:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, padding, start_rel, end_rel
-                )
-            }
-            "vibrant-green" => {
-                // High-energy neon green text with outline & drop shadow (Hormozi style)
-                let borderw = ((fontsize as f64) * 0.08).clamp(1.5, 6.0).round() as i64;
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.7:fontsize={}:fontcolor=0x39FF14:borderw={}:bordercolor=black:shadowcolor=black@0.6:shadowx=2:shadowy=2:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, borderw, start_rel, end_rel
-                )
-            }
-            "vibrant-red" => {
-                // Dramatic red text with outline & drop shadow (Gaming/Drama style)
-                let borderw = ((fontsize as f64) * 0.08).clamp(1.5, 6.0).round() as i64;
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.7:fontsize={}:fontcolor=0xFF3B30:borderw={}:bordercolor=black:shadowcolor=black@0.6:shadowx=2:shadowy=2:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, borderw, start_rel, end_rel
-                )
-            }
-            _ => {
-                // modern-box (Default): white text with clean box background
-                format!(
-                    "drawtext={}text='{}':x=(w-text_w)/2:y=h*0.72:fontsize={}:fontcolor=white:box=1:boxcolor=0x000000b0:boxborderw={}:enable='between(t,{:.3},{:.3})'",
-                    font_option, clean_text, fontsize, padding, start_rel, end_rel
-                )
-            }
-        };
-        drawtext_filters.push(drawtext);
+        filters.push(format!(
+            "drawtext={font_option}text='{text}':fontsize='{fontsize}':{style}:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,{show:.3},{hide:.3})'"
+        ));
     }
-
-    drawtext_filters.join(",")
+    filters.join(",")
 }
 
 #[cfg(test)]
@@ -1282,31 +1298,34 @@ mod tests {
     use super::*;
     use crate::models::TranscriptWord;
 
+    fn w(text: &str, start: f64, end: f64) -> TranscriptWord {
+        TranscriptWord { text: text.to_string(), start, end, speaker: None }
+    }
+
     #[test]
-    fn test_build_drawtext_filters_formatting() {
-        let words = vec![
-            TranscriptWord {
-                text: "Hello".to_string(),
-                start: 0.0,
-                end: 1.0,
-                speaker: None,
-            },
-            TranscriptWord {
-                text: "world".to_string(),
-                start: 1.0,
-                end: 2.0,
-                speaker: None,
-            },
-        ];
+    fn captions_are_one_word_at_a_time_and_highlight_loud_words() {
+        let words = vec![w("Don't", 10.2, 10.5), w("move,", 10.5, 10.9), w("NOOO!", 12.0, 12.6), w("ok", 30.0, 30.2)];
+        let spikes = [LoudnessSpike { start: 12.0, end: 13.0, peak_sec: 12.0, peak_db: -8.0, excess_db: 18.0 }];
+        let result = build_drawtext_filters(&words, 10.0, 20.0, 1080, "tiktok", &spikes);
+        let parts: Vec<&str> = result.split(",drawtext=").collect();
+        assert_eq!(parts.len(), 3, "{result}"); // "ok" is outside the clip
+        assert!(parts[0].contains("text='DON’T'"));
+        assert!(parts[1].contains("text='MOVE'"));
+        assert!(parts[2].contains("text='NOOO!'"));
+        // DON'T stays up until MOVE starts; the last word is held briefly after it is spoken.
+        assert!(parts[0].contains("between(t,0.200,0.500)"));
+        assert!(parts[2].contains("between(t,2.000,3.100)"));
+        // Normal words white, the shouted one highlighted and bigger.
+        assert!(parts[0].contains("fontcolor=white") && parts[2].contains("fontcolor=0xFFE11A"));
+        assert!(parts[0].contains("fontsize='162*(0.75+0.25*min(1,(t-0.200)/0.1))'"));
+        assert!(parts[2].contains("fontsize='186*"));
+        assert!(parts[0].contains("x=(w-text_w)/2:y=(h-text_h)/2"));
+    }
 
-        let result = build_drawtext_filters(&words, 0.0, 5.0, 1080, "classic-outline");
-        assert!(!result.is_empty());
-        assert!(result.contains("drawtext="));
-        assert!(result.contains("text='HELLO WORLD'"));
-
-        if result.contains("fontfile=") {
-            assert!(result.contains("fontfile='"));
-            assert!(!result.contains("\\:"));
-        }
+    #[test]
+    fn long_words_shrink_to_fit_the_frame() {
+        let result = build_drawtext_filters(&[w("unbelievable", 0.0, 1.0)], 0.0, 5.0, 1080, "tiktok", &[]);
+        let size: f64 = result.split("fontsize='").nth(1).unwrap().split('*').next().unwrap().parse().unwrap();
+        assert!(size * 12.0 * 0.75 <= 1080.0 * 0.88 + 1.0, "{size}");
     }
 }

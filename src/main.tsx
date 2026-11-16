@@ -134,7 +134,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [renderingCandidateId, setRenderingCandidateId] = useState<string | null>(null);
   const [showStyleModal, setShowStyleModal] = useState(false);
-  const [selectedStyle, setSelectedStyle] = useState("modern-box");
+  const [selectedStyle, setSelectedStyle] = useState("tiktok");
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
@@ -1220,16 +1220,27 @@ function App() {
           <div className="style-modal">
             <div className="style-modal-header">
               <h3>Choose Caption Style</h3>
-              <p>Select how your automated captions should look on the portrait short-form video clips.</p>
+              <p>Every style shows one big word at a time, popping in as it's spoken. Shouted words are highlighted.</p>
             </div>
 
             <div className="style-grid">
+              <div
+                className={`style-card ${selectedStyle === "tiktok" ? "selected" : ""}`}
+                onClick={() => setSelectedStyle("tiktok")}
+              >
+                <div className="style-preview-box">
+                  <span className="preview-text-tiktok">NO <em>WAY!</em></span>
+                </div>
+                <div className="style-card-title">TikTok Gaming</div>
+                <div className="style-card-desc">Huge white words with a heavy black outline. Screams and shouts flash yellow. The classic gaming-clip look.</div>
+              </div>
+
               <div
                 className={`style-card ${selectedStyle === "modern-box" ? "selected" : ""}`}
                 onClick={() => setSelectedStyle("modern-box")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-box">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-box">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Modern Box</div>
                 <div className="style-card-desc">Sleek white text inside a semi-transparent black background padding box. Highly readable.</div>
@@ -1240,7 +1251,7 @@ function App() {
                 onClick={() => setSelectedStyle("classic-outline")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-outline">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-outline">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Classic Outline</div>
                 <div className="style-card-desc">Vibrant bold yellow text with a clean black outline. High-energy CapCut formatting.</div>
@@ -1251,7 +1262,7 @@ function App() {
                 onClick={() => setSelectedStyle("minimal-shadow")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-shadow">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-shadow">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Minimal Shadow</div>
                 <div className="style-card-desc">Pure white text with a soft, elegant drop shadow. Unobtrusive and modern.</div>
@@ -1262,7 +1273,7 @@ function App() {
                 onClick={() => setSelectedStyle("vibrant-cyan")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-cyan">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-cyan">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Vibrant Cyan</div>
                 <div className="style-card-desc">Vibrant tech cyan text with a black drop shadow for a clean look.</div>
@@ -1273,7 +1284,7 @@ function App() {
                 onClick={() => setSelectedStyle("vibrant-yellow-box")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-yellow-box">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-yellow-box">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Vibrant Yellow Box</div>
                 <div className="style-card-desc">Bold black text inside a solid yellow padding box. Punchy and high visibility.</div>
@@ -1284,7 +1295,7 @@ function App() {
                 onClick={() => setSelectedStyle("vibrant-green")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-green">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-green">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Vibrant Green</div>
                 <div className="style-card-desc">High-energy neon green text with black borders and a drop shadow (Hormozi style).</div>
@@ -1295,7 +1306,7 @@ function App() {
                 onClick={() => setSelectedStyle("vibrant-red")}
               >
                 <div className="style-preview-box">
-                  <span className="preview-text-red">BRAINFOOD BECAUSE</span>
+                  <span className="preview-text-red">BRAINFOOD</span>
                 </div>
                 <div className="style-card-title">Vibrant Red</div>
                 <div className="style-card-desc">Dramatic neon crimson text with outline and drop shadow (gaming/action style).</div>
