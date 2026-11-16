@@ -343,8 +343,118 @@ fn extract_project_audio(
     Ok(audio_path.to_string_lossy().to_string())
 }
 
+/// Long recordings are transcribed in pieces of this length, with a little overlap.
+const TRANSCRIBE_CHUNK_SECS: f64 = 20.0 * 60.0;
+const TRANSCRIBE_OVERLAP_SECS: f64 = 10.0;
+
+/// Progress of a long-running step, sent to the UI as the `pipeline-progress` event.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineProgress {
+    project_id: String,
+    stage: &'static str,
+    done: usize,
+    total: usize,
+}
+
+fn emit_progress(app: &tauri::AppHandle, project_id: &str, stage: &'static str, done: usize, total: usize) {
+    let _ = app.emit(
+        "pipeline-progress",
+        PipelineProgress { project_id: project_id.to_string(), stage, done, total },
+    );
+}
+
+#[derive(Clone)]
+enum TranscribeEngine {
+    Deepgram { api_key: String },
+    Local { model_path: String },
+}
+
+impl TranscribeEngine {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Deepgram { .. } => "deepgram",
+            Self::Local { .. } => "local",
+        }
+    }
+    /// Pieces handled at once: uploads overlap well; local Whisper already uses the whole CPU.
+    fn concurrency(&self) -> usize {
+        match self {
+            Self::Deepgram { .. } => 3,
+            Self::Local { .. } => 1,
+        }
+    }
+    /// Network calls are retried; a local Whisper failure won't fix itself.
+    fn attempts(&self) -> usize {
+        match self {
+            Self::Deepgram { .. } => 3,
+            Self::Local { .. } => 1,
+        }
+    }
+    fn audio_extension(&self) -> &'static str {
+        match self {
+            Self::Deepgram { .. } => "flac", // about half the size of WAV to upload
+            Self::Local { .. } => "wav",
+        }
+    }
+    async fn transcribe(&self, audio_path: &str) -> anyhow::Result<NormalizedTranscript> {
+        match self {
+            Self::Deepgram { api_key } => transcription::transcribe_deepgram(audio_path, api_key).await,
+            Self::Local { model_path } => transcription::transcribe_local(audio_path, model_path).await,
+        }
+    }
+}
+
+/// Transcribes one piece, or reads it back if an earlier run already finished it.
+/// The result is already moved onto the full recording's timeline.
+async fn transcribe_piece(
+    engine: TranscribeEngine,
+    source_path: String,
+    chunk: media::AudioChunk,
+    work_dir: PathBuf,
+) -> Result<NormalizedTranscript, String> {
+    let saved = work_dir.join(format!("{}-{:03}-{:.0}.json", engine.name(), chunk.index, chunk.start));
+    if let Some(piece) = std::fs::read_to_string(&saved)
+        .ok()
+        .and_then(|json| serde_json::from_str::<NormalizedTranscript>(&json).ok())
+    {
+        return Ok(piece);
+    }
+
+    let audio = work_dir.join(format!("part-{:03}.{}", chunk.index, engine.audio_extension()));
+    {
+        let audio = audio.clone();
+        tokio::task::spawn_blocking(move || media::extract_audio_chunk(&source_path, &chunk, &audio))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(to_command_error)?;
+    }
+
+    let audio_str = audio.to_string_lossy().to_string();
+    let mut last_error = String::new();
+    for attempt in 0..engine.attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(5 * attempt as u64)).await;
+        }
+        match engine.transcribe(&audio_str).await {
+            Ok(piece) => {
+                let piece = transcription::shift_and_trim(piece, chunk.start, chunk.keep_from, chunk.keep_to);
+                if let Ok(json) = serde_json::to_string(&piece) {
+                    let _ = std::fs::write(&saved, json);
+                }
+                let _ = std::fs::remove_file(&audio);
+                return Ok(piece);
+            }
+            Err(error) => last_error = to_command_error(error),
+        }
+    }
+    let _ = std::fs::remove_file(&audio);
+    Err(last_error)
+}
+
 #[tauri::command]
 async fn transcribe_project(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_id: String,
     provider: String,
@@ -353,52 +463,83 @@ async fn transcribe_project(
     let db = state.db.clone();
     let data_dir = state.data_dir.clone();
     let project = db.get_project(&project_id).map_err(to_command_error)?;
-    db.update_project_status(&project_id, "transcribing", None)
-        .map_err(to_command_error)?;
 
-    let transcript = match provider.as_str() {
-        "deepgram" => {
-            let key = api_key
+    let engine = match provider.as_str() {
+        "deepgram" => TranscribeEngine::Deepgram {
+            api_key: api_key
                 .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
                 .ok_or_else(|| {
-                    "Set DEEPGRAM_API_KEY or paste an API key to use cloud transcription."
-                        .to_string()
-                })?;
-            let audio_path = media::extract_audio(
-                &project.source_path,
-                &data_dir.join("projects").join(&project_id),
-            )
-            .map_err(to_command_error)?;
-            transcription::transcribe_deepgram(&audio_path.to_string_lossy(), &key)
-                .await
-                .map_err(to_command_error)?
-        }
+                    "Set DEEPGRAM_API_KEY or paste an API key to use cloud transcription.".to_string()
+                })?,
+        },
         "local" => {
             let has_whisper = transcription::whisper_cli_exists() || transcription::whisper_python_exists();
             if !has_whisper {
                 return Err("Whisper is not installed. Please install it (e.g., via Homebrew 'brew install whisper-cli' or via Python 'pip3 install openai-whisper').".to_string());
             }
-            let audio_path = media::extract_audio(
-                &project.source_path,
-                &data_dir.join("projects").join(&project_id),
-            )
-            .map_err(to_command_error)?;
-            transcription::transcribe_local(&audio_path.to_string_lossy(), &data_dir.to_string_lossy())
-                .await
-                .map_err(to_command_error)?
+            TranscribeEngine::Local { model_path: data_dir.to_string_lossy().to_string() }
         }
         other => return Err(format!("Unsupported transcription provider: {other}")),
     };
 
+    db.update_project_status(&project_id, "transcribing", None)
+        .map_err(to_command_error)?;
+
+    let duration = match project.source_duration {
+        Some(d) if d > 0.0 => d,
+        _ => {
+            let path = project.source_path.clone();
+            tokio::task::spawn_blocking(move || media::probe_media(&path).ok().and_then(|p| p.duration_sec))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(f64::NAN) // unknown length: transcribe as one piece
+        }
+    };
+    let chunks = media::plan_audio_chunks(duration, TRANSCRIBE_CHUNK_SECS, TRANSCRIBE_OVERLAP_SECS);
+    let total = chunks.len();
+    let work_dir = project_dir(&state, &project_id).join("transcript_parts");
+    std::fs::create_dir_all(&work_dir).map_err(to_command_error)?;
+
+    emit_progress(&app, &project_id, "transcribe", 0, total);
+    let mut pieces: Vec<Option<NormalizedTranscript>> = vec![None; total];
+    let mut pending = chunks.into_iter();
+    let mut running = tokio::task::JoinSet::new();
+    let mut done = 0;
+    loop {
+        while running.len() < engine.concurrency() {
+            let Some(chunk) = pending.next() else { break };
+            let (engine, source, dir) = (engine.clone(), project.source_path.clone(), work_dir.clone());
+            running.spawn(async move { (chunk, transcribe_piece(engine, source, chunk, dir).await) });
+        }
+        let Some(joined) = running.join_next().await else { break };
+        let (chunk, result) = joined.map_err(|e| e.to_string())?;
+        match result {
+            Ok(piece) => {
+                pieces[chunk.index] = Some(piece);
+                done += 1;
+                emit_progress(&app, &project_id, "transcribe", done, total);
+            }
+            Err(error) => {
+                let end = chunk.end.map(llm::format_clock).unwrap_or_else(|| "end".to_string());
+                return Err(format!(
+                    "Transcription stopped at part {} of {} ({}-{}): {error}\n\
+Click Transcribe again to continue. The {done} finished part(s) are saved and won't be redone.",
+                    chunk.index + 1,
+                    total,
+                    llm::format_clock(chunk.start),
+                    end,
+                ));
+            }
+        }
+    }
+
+    let transcript = transcription::merge_pieces(pieces.into_iter().flatten().collect(), duration);
     let raw_json = serde_json::to_string_pretty(&transcript).map_err(to_command_error)?;
     let saved = db
-        .save_transcript(
-            &project_id,
-            &provider,
-            &raw_json,
-            Some(&transcript.language),
-        )
+        .save_transcript(&project_id, &provider, &raw_json, Some(&transcript.language))
         .map_err(to_command_error)?;
+    let _ = std::fs::remove_dir_all(&work_dir);
     db.update_project_status(&project_id, "analyzing", Some(transcript.duration))
         .map_err(to_command_error)?;
     Ok(saved)
@@ -424,6 +565,7 @@ fn save_demo_transcript(
 
 #[tauri::command]
 async fn generate_candidates(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_id: String,
     api_key: Option<String>,
@@ -452,64 +594,56 @@ async fn generate_candidates(
         .unwrap_or_else(|| "deepseek".to_string())
         .to_lowercase();
 
-    let drafts = match active_provider.as_str() {
+    let choice = match active_provider.as_str() {
         "claude" => {
             let key = api_key
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                 .ok_or_else(|| "Set ANTHROPIC_API_KEY or supply Claude API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_claude(&normalized, &spikes, &key)
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::Claude { api_key: key }
         }
         "local" | "ollama" => {
             let model = model_name
                 .or_else(|| std::env::var("OLLAMA_MODEL").ok())
                 .unwrap_or_else(|| "llama3.2".to_string());
-            llm::detect_candidates_with_local_llm(&normalized, &spikes, &model)
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::Local { model }
         }
         "gemini" => {
             let key = api_key
                 .or_else(|| std::env::var("GEMINI_API_KEY").ok())
                 .ok_or_else(|| "Set GEMINI_API_KEY or supply Gemini API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_gemini(&normalized, &spikes, &key)
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::Gemini { api_key: key }
         }
         "openai" => {
             let key = api_key
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .ok_or_else(|| "Set OPENAI_API_KEY or supply OpenAI API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_openai(&normalized, &spikes, &key)
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::OpenAi { api_key: key }
         }
         "openrouter" => {
             let key = api_key
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
                 .ok_or_else(|| "Set OPENROUTER_API_KEY or supply OpenRouter API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_openrouter(&normalized, &spikes, &key, model_name.as_deref())
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::OpenRouter { api_key: key, model: model_name }
         }
         "groq" => {
             let key = api_key
                 .or_else(|| std::env::var("GROQ_API_KEY").ok())
                 .ok_or_else(|| "Set GROQ_API_KEY or supply Groq API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_groq(&normalized, &spikes, &key)
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::Groq { api_key: key }
         }
         _ => {
             let key = api_key
                 .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
                 .ok_or_else(|| "Set DEEPSEEK_API_KEY or supply DeepSeek API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_deepseek(&normalized, &spikes, &key, model_name.as_deref())
-                .await
-                .map_err(to_command_error)?
+            llm::LlmChoice::DeepSeek { api_key: key, model: model_name }
         }
     };
+
+    let drafts = llm::detect_candidates(&choice, &normalized, &spikes, |done, total| {
+        emit_progress(&app, &project_id, "analyze", done, total)
+    })
+    .await
+    .map_err(to_command_error)?;
 
     if drafts.is_empty() {
         return Err("No viable clip candidates were returned for this transcript.".to_string());
@@ -531,7 +665,7 @@ fn set_selected_clip_count(
 ) -> Result<Vec<Candidate>, String> {
     state
         .db
-        .set_selected_clip_count(&project_id, count.clamp(0, 10))
+        .set_selected_clip_count(&project_id, count.clamp(0, 25))
         .map_err(to_command_error)
 }
 
@@ -944,7 +1078,9 @@ fn demo_transcript() -> NormalizedTranscript {
 }
 
 fn to_command_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+    // `{:#}` includes the causes behind an error ("calling Deepgram: connection reset"),
+    // not just the outermost message.
+    format!("{error:#}")
 }
 
 fn generate_srt(words: &[TranscriptWord], start_sec: f64, end_sec: f64) -> String {

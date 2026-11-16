@@ -9,11 +9,20 @@ pub async fn transcribe_deepgram(audio_path: &str, api_key: &str) -> Result<Norm
     let bytes = tokio::fs::read(audio_path)
         .await
         .with_context(|| format!("reading audio file {audio_path}"))?;
+    let content_type = if audio_path.to_ascii_lowercase().ends_with(".flac") {
+        "audio/flac"
+    } else {
+        "audio/wav"
+    };
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        // Generous: a 20-minute piece uploads and transcribes well inside this on a slow line.
+        .timeout(std::time::Duration::from_secs(15 * 60))
+        .build()
+        .context("building HTTP client")?
         .post("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&diarize=true&punctuate=true&filler_words=true")
         .header("Authorization", format!("Token {api_key}"))
-        .header("Content-Type", "audio/wav")
+        .header("Content-Type", content_type)
         .body(bytes)
         .send()
         .await
@@ -93,6 +102,65 @@ fn normalize_deepgram(value: Value) -> Result<NormalizedTranscript> {
         words,
         segments,
     })
+}
+
+/// Moves a piece's timestamps onto the full recording's timeline (`offset` seconds in)
+/// and keeps only what falls in `keep_from..keep_to`, judged by each word's midpoint.
+pub fn shift_and_trim(
+    piece: NormalizedTranscript,
+    offset: f64,
+    keep_from: f64,
+    keep_to: f64,
+) -> NormalizedTranscript {
+    let inside = |start: f64, end: f64| {
+        let mid = (start + end) / 2.0;
+        mid >= keep_from && mid < keep_to
+    };
+    let words = piece
+        .words
+        .into_iter()
+        .map(|w| TranscriptWord { start: w.start + offset, end: w.end + offset, ..w })
+        .filter(|w| inside(w.start, w.end))
+        .collect();
+    let segments = piece
+        .segments
+        .into_iter()
+        .map(|s| TranscriptSegment { start: s.start + offset, end: s.end + offset, ..s })
+        .filter(|s| inside(s.start, s.end))
+        .collect();
+    NormalizedTranscript { words, segments, ..piece }
+}
+
+/// Stitches pieces (already shifted with [`shift_and_trim`]) into one transcript.
+pub fn merge_pieces(pieces: Vec<NormalizedTranscript>, duration: f64) -> NormalizedTranscript {
+    let language = pieces
+        .iter()
+        .map(|p| p.language.clone())
+        .find(|l| !l.is_empty())
+        .unwrap_or_else(|| "en".to_string());
+    let mut speakers = BTreeSet::new();
+    let mut words = Vec::new();
+    let mut segments = Vec::new();
+    for piece in pieces {
+        speakers.extend(piece.speakers);
+        words.extend(piece.words);
+        segments.extend(piece.segments);
+    }
+    words.sort_by(|a, b| a.start.total_cmp(&b.start));
+    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+
+    // With word timings, rebuild sentences across piece boundaries; otherwise keep the pieces' own.
+    if !words.is_empty() {
+        segments = build_segments(&words);
+    }
+    let last_end = segments.last().map(|s| s.end).unwrap_or(0.0);
+    NormalizedTranscript {
+        language,
+        duration: duration.max(last_end),
+        speakers: speakers.into_iter().collect(),
+        words,
+        segments,
+    }
 }
 
 pub fn build_segments(words: &[TranscriptWord]) -> Vec<TranscriptSegment> {
@@ -387,5 +455,41 @@ if __name__ == "__main__":
         })
         .await
         .context("spawn_blocking failed")?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(text: &str, start: f64, end: f64) -> TranscriptWord {
+        TranscriptWord { text: text.into(), start, end, speaker: Some("S1".into()) }
+    }
+
+    fn piece(words: Vec<TranscriptWord>) -> NormalizedTranscript {
+        let segments = build_segments(&words);
+        NormalizedTranscript { language: "en".into(), duration: 0.0, speakers: vec!["S1".into()], words, segments }
+    }
+
+    #[test]
+    fn overlapping_pieces_merge_without_duplicates_or_gaps() {
+        // Piece 0 covers 0..1210 s (keeps 0..1200); piece 1 starts at 1190 s (keeps 1200..).
+        // Both heard "boundary" at 1199.5-1200.3 s (midpoint 1199.9): only piece 0 keeps it.
+        let p0 = piece(vec![word("before", 1190.0, 1190.5), word("boundary", 1199.5, 1200.3)]);
+        let p1 = piece(vec![
+            word("boundary", 9.5, 10.3), // same word, piece-local time
+            word("after", 10.6, 11.0),
+            word("later", 500.0, 500.4),
+        ]);
+        let merged = merge_pieces(
+            vec![shift_and_trim(p0, 0.0, 0.0, 1200.0), shift_and_trim(p1, 1190.0, 1200.0, f64::MAX)],
+            1800.0,
+        );
+        let texts: Vec<&str> = merged.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["before", "boundary", "after", "later"]);
+        assert_eq!(merged.words[2].start, 1200.6);
+        assert_eq!(merged.words[3].start, 1690.0);
+        assert_eq!(merged.duration, 1800.0);
+        assert!(merged.segments.iter().all(|s| s.start >= 1190.0));
     }
 }

@@ -89,6 +89,13 @@ type Clip = {
   renderLog: string | null;
 };
 
+type PipelineProgress = {
+  projectId: string;
+  stage: "transcribe" | "analyze";
+  done: number;
+  total: number;
+};
+
 type ProjectDetail = {
   project: Project;
   transcript: Transcript | null;
@@ -122,6 +129,7 @@ function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [busy, setBusy] = useState<BusyState>("idle");
+  const [progress, setProgress] = useState<PipelineProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [renderingCandidateId, setRenderingCandidateId] = useState<string | null>(null);
@@ -226,6 +234,23 @@ function App() {
               : llmEngine === "groq"
                 ? canUseGroq
                 : false;
+
+  useEffect(() => {
+    let stop: (() => void) | null = null;
+    let cancelled = false;
+    void listen<PipelineProgress>("pipeline-progress", (event) => setProgress(event.payload)).then((unlisten) => {
+      if (cancelled) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (busy === "idle") setProgress(null);
+  }, [busy]);
 
   useEffect(() => {
     void refresh();
@@ -924,6 +949,19 @@ function App() {
               )}
 
               {error && <div className="error-banner">{error}</div>}
+
+              {progress && progress.total > 1 && progress.projectId === detail.project.id && busy !== "idle" && (
+                <div className="pipeline-progress" role="status">
+                  <Loader2 className="spin" size={14} />
+                  <span>
+                    {progress.stage === "transcribe" ? "Transcribing" : "Finding moments"}: {progress.done} of{" "}
+                    {progress.total} parts done
+                  </span>
+                  <div className="pipeline-progress-bar">
+                    <div style={{ width: `${(progress.done / progress.total) * 100}%` }} />
+                  </div>
+                </div>
+              )}
 
               <div className="pipeline-strip">
                 <PipelineStep icon={<AudioLines size={16} />} label="Transcript" done={Boolean(detail.transcript)} />

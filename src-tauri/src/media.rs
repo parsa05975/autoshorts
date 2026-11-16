@@ -436,6 +436,82 @@ pub fn find_loudness_spikes(levels: &[f32]) -> Vec<LoudnessSpike> {
     spikes
 }
 
+/// One piece of a long recording that is transcribed on its own.
+///
+/// Pieces overlap so no word is cut in half at a boundary. Each piece only *keeps*
+/// the words whose midpoint falls in `keep_from..keep_to`, so overlapping words are
+/// counted exactly once when the pieces are stitched back together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioChunk {
+    pub index: usize,
+    /// Where extraction starts in the source, in seconds.
+    pub start: f64,
+    /// Where extraction ends; `None` means "to the end of the file".
+    pub end: Option<f64>,
+    pub keep_from: f64,
+    pub keep_to: f64,
+}
+
+/// Splits a recording of `duration` seconds into `chunk_secs` pieces with `overlap_secs`
+/// of extra audio on each side. A recording that fits in one piece stays whole, and a
+/// short leftover at the end is folded into the previous piece.
+pub fn plan_audio_chunks(duration: f64, chunk_secs: f64, overlap_secs: f64) -> Vec<AudioChunk> {
+    let whole = AudioChunk { index: 0, start: 0.0, end: None, keep_from: 0.0, keep_to: f64::MAX };
+    if !duration.is_finite() || duration <= chunk_secs + overlap_secs {
+        return vec![whole];
+    }
+
+    let mut count = (duration / chunk_secs).ceil() as usize;
+    // Avoid a tiny final piece (under a quarter of a chunk): merge it into the one before.
+    if duration - (count - 1) as f64 * chunk_secs < chunk_secs / 4.0 {
+        count -= 1;
+    }
+
+    (0..count)
+        .map(|index| {
+            let last = index + 1 == count;
+            let keep_from = index as f64 * chunk_secs;
+            let keep_to = if last { f64::MAX } else { (index + 1) as f64 * chunk_secs };
+            AudioChunk {
+                index,
+                start: (keep_from - overlap_secs).max(0.0),
+                // The last piece runs to the end of the file, in case the probed length is short.
+                end: if last { None } else { Some(keep_to + overlap_secs) },
+                keep_from,
+                keep_to,
+            }
+        })
+        .collect()
+}
+
+/// Cuts one piece of audio out of the source as 16 kHz mono. The format follows the
+/// output extension (`.flac` for upload, `.wav` for local Whisper).
+pub fn extract_audio_chunk(source_path: &str, chunk: &AudioChunk, output_path: &Path) -> Result<()> {
+    if !command_exists("ffmpeg") {
+        return Err(anyhow!("ffmpeg is not installed or not available on PATH"));
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let start = format!("{:.3}", chunk.start);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-y", "-ss", &start, "-i", source_path]);
+    if let Some(end) = chunk.end {
+        cmd.args(["-t", &format!("{:.3}", (end - chunk.start).max(0.1))]);
+    }
+    cmd.args(["-vn", "-ac", "1", "-ar", "16000"]).arg(output_path);
+
+    let output = cmd.output().context("running ffmpeg audio chunk extraction")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "ffmpeg audio extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +616,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(levels.len(), 7, "{levels:?}");
         assert!(levels[3] - levels[1] > 20.0, "{levels:?}");
+    }
+
+    #[test]
+    fn short_recordings_stay_in_one_piece() {
+        let chunks = plan_audio_chunks(1250.0, 1200.0, 10.0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].end, None);
+    }
+
+    #[test]
+    fn six_hour_stream_is_covered_by_overlapping_pieces() {
+        let duration = 6.0 * 3600.0 + 125.0;
+        let chunks = plan_audio_chunks(duration, 1200.0, 10.0);
+        // 6 h 2 min: 18 full pieces; the 2-minute leftover joins the last one.
+        assert_eq!(chunks.len(), 18);
+        assert_eq!(chunks[0].start, 0.0);
+        assert_eq!(chunks[0].end, Some(1210.0));
+        assert_eq!(chunks[1].start, 1190.0);
+        assert_eq!(chunks[17].end, None);
+        // Keep ranges tile the timeline with no gaps and no double counting.
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].keep_to, pair[1].keep_from);
+        }
+        assert_eq!(chunks[17].keep_to, f64::MAX);
+    }
+
+    #[test]
+    fn audio_chunk_is_cut_with_requested_length() {
+        if !command_exists("ffmpeg") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("autoshorts-chunk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.wav");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=30"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let chunk = AudioChunk { index: 1, start: 10.0, end: Some(22.0), keep_from: 12.0, keep_to: 20.0 };
+        let out = dir.join("part.flac");
+        extract_audio_chunk(src.to_str().unwrap(), &chunk, &out).unwrap();
+        let probe = probe_media(out.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let d = probe.duration_sec.unwrap();
+        assert!((d - 12.0).abs() < 0.1, "{d}");
     }
 }

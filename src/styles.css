@@ -1944,3 +1944,32 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* Progress for long transcriptions / analyses */
+.pipeline-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+}
+
+.pipeline-progress-bar {
+  flex: 1;
+  height: 6px;
+  max-width: 320px;
+  margin-left: auto;
+  background: var(--bg-input);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.pipeline-progress-bar > div {
+  height: 100%;
+  background: var(--accent-primary);
+  transition: width 0.3s ease;
+}

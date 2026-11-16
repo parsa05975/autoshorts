@@ -30,13 +30,12 @@ struct DeepseekResponse {
     choices: Vec<DeepseekChoice>,
 }
 
-pub async fn detect_candidates_with_deepseek(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_deepseek(
+    prompt: &MomentPrompt,
     api_key: &str,
     model_name: Option<&str>,
-) -> Result<Vec<CandidateDraft>> {
-    let prompt = build_prompt(transcript, spikes);
+) -> Result<String> {
+    let prompt = prompt.combined();
 
     let default_model = "deepseek-chat".to_string();
     let model = model_name
@@ -78,7 +77,7 @@ pub async fn detect_candidates_with_deepseek(
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("DeepSeek response did not include choices content"))?;
 
-    finish_candidates(&text, transcript, spikes)
+    Ok(text)
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,12 +100,11 @@ struct GeminiPart {
     text: Option<String>,
 }
 
-pub async fn detect_candidates_with_gemini(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_gemini(
+    prompt: &MomentPrompt,
     api_key: &str,
-) -> Result<Vec<CandidateDraft>> {
-    let prompt = build_prompt(transcript, spikes);
+) -> Result<String> {
+    let prompt = prompt.combined();
 
     let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
     let url = format!(
@@ -149,7 +147,7 @@ pub async fn detect_candidates_with_gemini(
         .and_then(|p| p.text.clone())
         .ok_or_else(|| anyhow!("Gemini response did not include content text"))?;
 
-    finish_candidates(&text, transcript, spikes)
+    Ok(text)
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,12 +165,11 @@ struct ChatCompletionMessage {
     content: String,
 }
 
-pub async fn detect_candidates_with_openai(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_openai(
+    prompt: &MomentPrompt,
     api_key: &str,
-) -> Result<Vec<CandidateDraft>> {
-    let prompt = build_prompt(transcript, spikes);
+) -> Result<String> {
+    let prompt = prompt.combined();
 
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
@@ -210,16 +207,15 @@ pub async fn detect_candidates_with_openai(
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("OpenAI response did not include choices content"))?;
 
-    finish_candidates(&text, transcript, spikes)
+    Ok(text)
 }
 
-pub async fn detect_candidates_with_openrouter(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_openrouter(
+    prompt: &MomentPrompt,
     api_key: &str,
     model_name: Option<&str>,
-) -> Result<Vec<CandidateDraft>> {
-    let prompt = build_prompt(transcript, spikes);
+) -> Result<String> {
+    let prompt = prompt.combined();
 
     let default_model = "google/gemini-2.5-flash".to_string();
     let model = model_name
@@ -264,15 +260,14 @@ pub async fn detect_candidates_with_openrouter(
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("OpenRouter response did not include choices content"))?;
 
-    finish_candidates(&text, transcript, spikes)
+    Ok(text)
 }
 
-pub async fn detect_candidates_with_groq(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_groq(
+    prompt: &MomentPrompt,
     api_key: &str,
-) -> Result<Vec<CandidateDraft>> {
-    let prompt = build_prompt(transcript, spikes);
+) -> Result<String> {
+    let prompt = prompt.combined();
 
     let model =
         std::env::var("GROQ_MODEL").unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string());
@@ -313,7 +308,7 @@ pub async fn detect_candidates_with_groq(
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("Groq response did not include choices content"))?;
 
-    finish_candidates(&text, transcript, spikes)
+    Ok(text)
 }
 
 #[derive(Debug, Serialize)]
@@ -322,12 +317,11 @@ struct ClaudeMessage<'a> {
     content: String,
 }
 
-pub async fn detect_candidates_with_claude(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_claude(
+    prompt: &MomentPrompt,
     api_key: &str,
-) -> Result<Vec<CandidateDraft>> {
-    let prompt = build_prompt(transcript, spikes);
+) -> Result<String> {
+    let prompt = prompt.combined();
 
     let model =
         std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string());
@@ -364,7 +358,7 @@ pub async fn detect_candidates_with_claude(
         .find_map(|content| content.text)
         .ok_or_else(|| anyhow!("Claude response did not include text content"))?;
 
-    finish_candidates(&text, transcript, spikes)
+    Ok(text)
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,18 +371,17 @@ struct OllamaResponse {
     message: OllamaMessage,
 }
 
-pub async fn detect_candidates_with_local_llm(
-    transcript: &NormalizedTranscript,
-    spikes: &[LoudnessSpike],
+async fn ask_local_llm(
+    prompt: &MomentPrompt,
     model_name: &str,
-) -> Result<Vec<CandidateDraft>> {
+) -> Result<String> {
     let system_instructions = format!(
         "{MOMENT_INSTRUCTIONS}\n\n\
 REMINDERS FOR THIS MODEL: Each clip MUST last between 20 and 60 seconds (end minus start). \
 Combine adjacent transcript lines to reach that length. Return at least 3 candidates; never an empty list. \
 start and end must be real timestamps from the transcript, never 0.0 for both."
     );
-    let user_content = moment_input(transcript, spikes);
+    let user_content = prompt.input.clone();
 
     let response = reqwest::Client::new()
         .post("http://localhost:11434/api/chat")
@@ -406,7 +399,8 @@ start and end must be real timestamps from the transcript, never 0.0 for both."
             ],
             "stream": false,
             "options": {
-                "temperature": 0.2
+                "temperature": 0.2,
+                "num_ctx": 16384
             },
             "format": {
                 "type": "object",
@@ -443,7 +437,7 @@ start and end must be real timestamps from the transcript, never 0.0 for both."
         .json()
         .await
         .context("parsing local Ollama response")?;
-    finish_candidates(&res_body.message.content, transcript, spikes)
+    Ok(res_body.message.content)
 }
 
 /// Instructions shared by every provider: what a great GTA 6 stream clip is and how to cut it.
@@ -493,27 +487,202 @@ const LOUDNESS_BONUS: f64 = 0.1;
 const FULL_BONUS_EXCESS_DB: f64 = 20.0;
 /// Shortest clip kept from a long stream.
 const MIN_CLIP_SECONDS: f64 = 15.0;
-/// Most clips kept per analysis.
+/// Most clips kept for a stream of up to an hour (longer streams keep more).
 const MAX_CANDIDATES: usize = 10;
 
-fn build_prompt(transcript: &NormalizedTranscript, spikes: &[LoudnessSpike]) -> String {
-    format!("{MOMENT_INSTRUCTIONS}\n\n{}", moment_input(transcript, spikes))
+/// Long transcripts are analyzed in parts of this length...
+const ANALYSIS_WINDOW_SECS: f64 = 30.0 * 60.0;
+/// ...each also seeing this much of the previous part, so a moment on a boundary is seen whole.
+const ANALYSIS_OVERLAP_SECS: f64 = 2.0 * 60.0;
+/// Parts sent to the AI at once, and tries per part.
+const ANALYSIS_CONCURRENCY: usize = 3;
+const ANALYSIS_ATTEMPTS: usize = 3;
+/// Clips may start or end this far outside their part; anything further is a made-up time.
+const WINDOW_SLACK_SECS: f64 = 30.0;
+
+/// Which AI to ask, with what it needs to answer.
+#[derive(Debug, Clone)]
+pub enum LlmChoice {
+    Claude { api_key: String },
+    Local { model: String },
+    Gemini { api_key: String },
+    OpenAi { api_key: String },
+    OpenRouter { api_key: String, model: Option<String> },
+    Groq { api_key: String },
+    DeepSeek { api_key: String, model: Option<String> },
 }
 
-fn format_clock(seconds: f64) -> String {
+impl LlmChoice {
+    async fn ask(&self, prompt: &MomentPrompt) -> Result<String> {
+        match self {
+            Self::Claude { api_key } => ask_claude(prompt, api_key).await,
+            Self::Local { model } => ask_local_llm(prompt, model).await,
+            Self::Gemini { api_key } => ask_gemini(prompt, api_key).await,
+            Self::OpenAi { api_key } => ask_openai(prompt, api_key).await,
+            Self::OpenRouter { api_key, model } => ask_openrouter(prompt, api_key, model.as_deref()).await,
+            Self::Groq { api_key } => ask_groq(prompt, api_key).await,
+            Self::DeepSeek { api_key, model } => ask_deepseek(prompt, api_key, model.as_deref()).await,
+        }
+    }
+
+    /// Local models share one machine; cloud APIs can take a few parts at once.
+    fn concurrency(&self) -> usize {
+        match self {
+            Self::Local { .. } => 1,
+            _ => ANALYSIS_CONCURRENCY,
+        }
+    }
+}
+
+/// The two halves of a request: fixed instructions and this part's data.
+#[derive(Debug, Clone)]
+struct MomentPrompt {
+    input: String,
+}
+
+impl MomentPrompt {
+    /// Instructions and data as one message, for providers that take a single prompt.
+    fn combined(&self) -> String {
+        format!("{MOMENT_INSTRUCTIONS}\n\n{}", self.input)
+    }
+}
+
+/// One slice of the stream that is analyzed on its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AnalysisWindow {
+    index: usize,
+    start: f64,
+    end: f64,
+}
+
+/// Splits a stream into parts. Each part starts a little before the previous one ends.
+/// A short stream is one part; a short leftover is folded into the last part.
+fn plan_windows(duration: f64) -> Vec<AnalysisWindow> {
+    if duration <= ANALYSIS_WINDOW_SECS + ANALYSIS_OVERLAP_SECS {
+        return vec![AnalysisWindow { index: 0, start: 0.0, end: duration }];
+    }
+    let mut count = (duration / ANALYSIS_WINDOW_SECS).ceil() as usize;
+    if duration - (count - 1) as f64 * ANALYSIS_WINDOW_SECS < ANALYSIS_WINDOW_SECS / 4.0 {
+        count -= 1;
+    }
+    (0..count)
+        .map(|index| AnalysisWindow {
+            index,
+            start: (index as f64 * ANALYSIS_WINDOW_SECS - ANALYSIS_OVERLAP_SECS).max(0.0),
+            end: if index + 1 == count { duration } else { (index + 1) as f64 * ANALYSIS_WINDOW_SECS },
+        })
+        .collect()
+}
+
+/// Most clips kept: 10 for streams up to an hour, 3 more per extra hour, at most 25.
+fn max_candidates(duration: f64) -> usize {
+    let extra_hours = ((duration - 3600.0) / 3600.0).ceil().max(0.0) as usize;
+    (MAX_CANDIDATES + 3 * extra_hours).min(25)
+}
+
+/// Finds clip candidates in a transcript of any length.
+///
+/// The stream is analyzed part by part (see [`plan_windows`]); every part is retried
+/// before giving up, so no stretch of the stream is silently skipped. `progress` is
+/// called with (parts done, total parts).
+pub async fn detect_candidates(
+    llm: &LlmChoice,
+    transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
+    progress: impl Fn(usize, usize),
+) -> Result<Vec<CandidateDraft>> {
+    let duration = transcript
+        .duration
+        .max(transcript.segments.last().map(|s| s.end).unwrap_or(0.0));
+    let windows = plan_windows(duration);
+    let total = windows.len();
+    let min_duration = min_clip_duration(transcript);
+
+    progress(0, total);
+    let mut pending = windows.into_iter();
+    let mut running = tokio::task::JoinSet::new();
+    let mut found = Vec::new();
+    let mut done = 0;
+    loop {
+        while running.len() < llm.concurrency() {
+            let Some(window) = pending.next() else { break };
+            let prompt = MomentPrompt { input: moment_input(transcript, spikes, duration, window, total) };
+            let llm = llm.clone();
+            running.spawn(async move {
+                let mut last_error = anyhow!("no attempt made");
+                for attempt in 0..ANALYSIS_ATTEMPTS {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5 * attempt as u64)).await;
+                    }
+                    match llm.ask(&prompt).await.and_then(|text| parse_candidate_json(&text, min_duration)) {
+                        Ok(candidates) => return (window, Ok(candidates)),
+                        // A missing local model won't appear by retrying; report it straight away.
+                        Err(error) if error.to_string().to_lowercase().contains("not found") => {
+                            return (window, Err(error))
+                        }
+                        Err(error) => last_error = error,
+                    }
+                }
+                (window, Err(last_error))
+            });
+        }
+        let Some(joined) = running.join_next().await else { break };
+        let (window, result) = joined.context("analysis task failed")?;
+        match result {
+            Ok(candidates) => {
+                found.extend(candidates.into_iter().filter(|c| {
+                    c.end > c.start
+                        && c.start >= window.start - WINDOW_SLACK_SECS
+                        && c.end <= window.end + WINDOW_SLACK_SECS
+                }));
+                done += 1;
+                progress(done, total);
+            }
+            Err(error) if total == 1 => return Err(error),
+            Err(error) => {
+                return Err(error.context(format!(
+                    "analysis stopped at part {} of {} ({}-{})",
+                    window.index + 1,
+                    total,
+                    format_clock(window.start),
+                    format_clock(window.end)
+                )))
+            }
+        }
+    }
+    Ok(rank_candidates(found, spikes, max_candidates(duration)))
+}
+
+pub(crate) fn format_clock(seconds: f64) -> String {
     let s = seconds.max(0.0).round() as u64;
     format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// The data part of the prompt: stream length, the loudest moments, and the tagged transcript.
-fn moment_input(transcript: &NormalizedTranscript, spikes: &[LoudnessSpike]) -> String {
-    let mut strongest: Vec<&LoudnessSpike> = spikes.iter().collect();
+/// The data part of a request: where this part sits in the stream, its loudest
+/// moments, and its transcript with loud lines tagged.
+fn moment_input(
+    transcript: &NormalizedTranscript,
+    spikes: &[LoudnessSpike],
+    stream_duration: f64,
+    window: AnalysisWindow,
+    total_windows: usize,
+) -> String {
+    let in_window = |start: f64, end: f64| start < window.end && end > window.start;
+    let part_spikes: Vec<LoudnessSpike> = spikes.iter().copied().filter(|s| in_window(s.start, s.end)).collect();
+    let part_segments: Vec<TranscriptSegment> = transcript
+        .segments
+        .iter()
+        .filter(|s| in_window(s.start, s.end))
+        .cloned()
+        .collect();
+
+    let mut strongest: Vec<&LoudnessSpike> = part_spikes.iter().collect();
     strongest.sort_by(|a, b| b.excess_db.total_cmp(&a.excess_db));
     strongest.truncate(MAX_PROMPT_SPIKES);
     strongest.sort_by(|a, b| a.start.total_cmp(&b.start));
 
     let spike_lines = if strongest.is_empty() {
-        "None detected (no audio track, or the audio level stays steady).".to_string()
+        "None detected in this part (no audio track, or the audio level stays steady).".to_string()
     } else {
         strongest
             .iter()
@@ -527,15 +696,30 @@ fn moment_input(transcript: &NormalizedTranscript, spikes: &[LoudnessSpike]) -> 
             .join("\n")
     };
 
+    let part_line = if total_windows > 1 {
+        format!(
+            "THIS IS PART {} OF {}: {} to {} ({:.0}-{:.0} s). Only pick clips inside this part. \
+It is fine to return few or no clips if nothing good happens here.\n",
+            window.index + 1,
+            total_windows,
+            format_clock(window.start),
+            format_clock(window.end),
+            window.start,
+            window.end
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "STREAM LENGTH: {} ({:.0} seconds)\n\n\
+        "STREAM LENGTH: {} ({:.0} seconds)\n{part_line}\n\
 LOUDNESS SPIKES (strongest {} shown, in time order; dB above the local baseline):\n{}\n\n\
 TRANSCRIPT (timestamps in seconds):\n{}",
-        format_clock(transcript.duration),
-        transcript.duration,
+        format_clock(stream_duration),
+        stream_duration,
         strongest.len(),
         spike_lines,
-        compact_segments(&transcript.segments, spikes)
+        compact_segments(&part_segments, &part_spikes)
     )
 }
 
@@ -556,14 +740,13 @@ fn min_clip_duration(transcript: &NormalizedTranscript) -> f64 {
     }
 }
 
-/// Parses the model's answer, then boosts clips containing big loudness spikes,
-/// drops clips that mostly repeat a better one, and keeps the best few.
-fn finish_candidates(
-    text: &str,
-    transcript: &NormalizedTranscript,
+/// Boosts clips containing big loudness spikes, drops clips that mostly repeat a
+/// better one (parts overlap, so the same moment can come back twice), keeps the best.
+fn rank_candidates(
+    mut candidates: Vec<CandidateDraft>,
     spikes: &[LoudnessSpike],
-) -> Result<Vec<CandidateDraft>> {
-    let mut candidates = parse_candidate_json(text, min_clip_duration(transcript))?;
+    limit: usize,
+) -> Vec<CandidateDraft> {
     for c in candidates.iter_mut() {
         if let Some(excess) = loudest_overlap(spikes, c.start, c.end) {
             c.score = (c.score + LOUDNESS_BONUS * (excess / FULL_BONUS_EXCESS_DB).min(1.0)).min(1.0);
@@ -580,11 +763,11 @@ fn finish_candidates(
         if !duplicate {
             kept.push(c);
         }
-        if kept.len() == MAX_CANDIDATES {
+        if kept.len() == limit {
             break;
         }
     }
-    Ok(kept)
+    kept
 }
 
 fn compact_segments(segments: &[TranscriptSegment], spikes: &[LoudnessSpike]) -> String {
@@ -770,6 +953,7 @@ mod tests {
             segments: vec![
                 TranscriptSegment { start: 100.0, end: 104.0, speaker: None, text: "chilling".into() },
                 TranscriptSegment { start: 200.0, end: 203.5, speaker: None, text: "NO NO NO".into() },
+                TranscriptSegment { start: 5000.0, end: 5004.0, speaker: None, text: "later on".into() },
             ],
         }
     }
@@ -778,28 +962,63 @@ mod tests {
         LoudnessSpike { start, end, peak_sec: start, peak_db: -10.0, excess_db }
     }
 
+    fn draft(start: f64, end: f64, score: f64, hook: &str) -> CandidateDraft {
+        CandidateDraft { start, end, score, hook: hook.into(), rationale: "[OTHER] x".into() }
+    }
+
     #[test]
     fn prompt_lists_spikes_and_tags_loud_lines() {
-        let input = moment_input(&transcript(7300.0), &[spike(201.0, 203.0, 17.2)]);
+        let t = transcript(7300.0);
+        let window = AnalysisWindow { index: 0, start: 0.0, end: 1800.0 };
+        let input = moment_input(&t, &[spike(201.0, 203.0, 17.2), spike(5001.0, 5002.0, 9.0)], 7300.0, window, 5);
         assert!(input.contains("STREAM LENGTH: 2:01:40"));
+        assert!(input.contains("THIS IS PART 1 OF 5: 0:00:00 to 0:30:00"));
         assert!(input.contains("- 201.0-203.0 s (peak at 201.0 s): +17.2 dB"));
         assert!(input.contains("[200.00-203.50] Speaker: NO NO NO <LOUD +17dB>"));
-        assert!(input.contains("[100.00-104.00] Speaker: chilling\n"));
-        let prompt = build_prompt(&transcript(7300.0), &[]);
-        assert!(prompt.contains("GTA 6") && prompt.contains("None detected"));
+        // Other parts' lines and spikes stay out of this part's prompt.
+        assert!(!input.contains("later on") && !input.contains("5001.0"));
+        let prompt = MomentPrompt { input }.combined();
+        assert!(prompt.starts_with("You are the clip editor for a GTA 6"));
+    }
+
+    #[test]
+    fn six_hour_stream_is_analyzed_in_overlapping_parts() {
+        let windows = plan_windows(6.0 * 3600.0);
+        assert_eq!(windows.len(), 12);
+        assert_eq!((windows[0].start, windows[0].end), (0.0, 1800.0));
+        assert_eq!((windows[1].start, windows[1].end), (1680.0, 3600.0));
+        assert_eq!(windows[11].end, 21600.0);
+        for pair in windows.windows(2) {
+            assert!(pair[1].start < pair[0].end, "gap between parts");
+        }
+        assert_eq!(plan_windows(1500.0).len(), 1);
+        assert_eq!(max_candidates(1500.0), 10);
+        assert_eq!(max_candidates(6.0 * 3600.0), 25);
     }
 
     #[test]
     fn loud_clips_are_boosted_and_overlapping_clips_dropped() {
+        let ranked = rank_candidates(
+            vec![
+                draft(180.0, 220.0, 0.80, "chase"),
+                draft(185.0, 225.0, 0.70, "same chase"),
+                draft(400.0, 440.0, 0.85, "quiet"),
+            ],
+            &[spike(201.0, 203.0, 20.0)],
+            10,
+        );
+        let hooks: Vec<&str> = ranked.iter().map(|c| c.hook.as_str()).collect();
+        assert_eq!(hooks, ["chase", "quiet"]);
+        assert!((ranked[0].score - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn short_clips_are_rejected_when_parsing() {
         let answer = r#"{"candidates":[
-            {"start":180,"end":220,"score":0.80,"hook":"chase","rationale":"[POLICE CHASE] x"},
-            {"start":185,"end":225,"score":0.70,"hook":"same chase","rationale":"[REACTION] x"},
-            {"start":400,"end":440,"score":0.85,"hook":"quiet","rationale":"[NPC] x"},
+            {"start":180,"end":220,"score":0.8,"hook":"ok","rationale":"[CRASH] x"},
             {"start":500,"end":505,"score":0.99,"hook":"too short","rationale":"[FAIL] x"}
         ]}"#;
-        let out = finish_candidates(answer, &transcript(3600.0), &[spike(201.0, 203.0, 20.0)]).unwrap();
-        let hooks: Vec<&str> = out.iter().map(|c| c.hook.as_str()).collect();
-        assert_eq!(hooks, ["chase", "quiet"]);
-        assert!((out[0].score - 0.90).abs() < 1e-9);
+        let parsed = parse_candidate_json(answer, MIN_CLIP_SECONDS).unwrap();
+        assert_eq!(parsed.len(), 1);
     }
 }
