@@ -3,13 +3,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::{
-    Candidate, CandidateDraft, Clip, ClipCopy, Project, ProjectDetail, Transcript,
+    Candidate, CandidateDraft, ClipCopy, ClipLayout, Clip, Project, ProjectDetail, Transcript,
 };
 
 #[derive(Clone)]
@@ -99,6 +99,7 @@ impl Database {
         )?;
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN name TEXT", []);
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN caption_style TEXT", []);
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN layout TEXT", []);
         Ok(())
     }
 
@@ -118,6 +119,7 @@ impl Database {
             status: "ingest".to_string(),
             transcription_mode: transcription_mode.to_string(),
             caption_style: Some(caption_style.to_string()),
+            layout: ClipLayout::Center,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -145,7 +147,7 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, layout
              FROM projects ORDER BY updated_at DESC",
         )?;
 
@@ -157,7 +159,7 @@ impl Database {
     pub fn get_project(&self, project_id: &str) -> Result<Project> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.query_row(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, layout
              FROM projects WHERE id = ?1",
             params![project_id],
             project_from_row,
@@ -325,7 +327,7 @@ impl Database {
                 candidates.id, candidates.project_id, candidates.start_sec, candidates.end_sec,
                 candidates.score, candidates.hook, candidates.rationale, candidates.rank, candidates.selected,
                 projects.id, projects.name, projects.source_path, projects.source_duration, projects.status,
-                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style
+                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style, projects.layout
              FROM candidates
              INNER JOIN projects ON projects.id = candidates.project_id
              WHERE candidates.id = ?1",
@@ -353,6 +355,7 @@ impl Database {
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     caption_style: row.get(17)?,
+                    layout: ClipLayout::from_db(row.get(18)?),
                 };
                 Ok((candidate, project))
             },
@@ -379,6 +382,20 @@ impl Database {
             params![status, output_path, caption_ass_path, render_log, candidate_id],
         )?;
         Ok(())
+    }
+
+    pub fn set_project_layout(&self, project_id: &str, layout: &ClipLayout) -> Result<Project> {
+        let json = serde_json::to_string(layout)?;
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE projects SET layout = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, Utc::now().to_rfc3339(), project_id],
+        )?;
+        drop(conn);
+        if changed == 0 {
+            return Err(anyhow!("project {project_id} not found"));
+        }
+        self.get_project(project_id)
     }
 
     pub fn set_selected_clip_count(
@@ -470,6 +487,7 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         caption_style: row.get(8)?,
+        layout: ClipLayout::from_db(row.get(9)?),
     })
 }
 

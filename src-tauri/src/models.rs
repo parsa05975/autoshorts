@@ -30,6 +30,36 @@ pub struct MediaProbe {
     pub audio_codec: Option<String>,
 }
 
+/// A rectangle inside the source video, as fractions of the frame (0.0–1.0).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// How a landscape source is turned into a 9:16 clip.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum ClipLayout {
+    /// Center-crop the whole frame to 9:16.
+    #[default]
+    Center,
+    /// Facecam region on the top third, center-cropped gameplay on the bottom two thirds.
+    Streamer { facecam: NormRect },
+}
+
+impl ClipLayout {
+    /// Parses the stored JSON, falling back to center crop for missing or unreadable values.
+    pub fn from_db(value: Option<String>) -> Self {
+        value
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -40,6 +70,7 @@ pub struct Project {
     pub status: String,
     pub transcription_mode: String,
     pub caption_style: Option<String>,
+    pub layout: ClipLayout,
     pub created_at: String,
     pub updated_at: String,
 }

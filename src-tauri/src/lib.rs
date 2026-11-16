@@ -11,7 +11,7 @@ use tauri::{Emitter, Manager};
 
 use db::Database;
 use models::{
-    Candidate, EnvironmentStatus, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
+    Candidate, ClipLayout, EnvironmentStatus, MediaProbe, NormalizedTranscript, Project, ProjectDetail,
     Transcript, TranscriptWord,
 };
 
@@ -551,7 +551,9 @@ async fn render_flat_clip_for_candidate(
         let mut drawtext_filters = None;
 
         let probe = media::probe_media(&project.source_path).ok();
-        let cropped_width = if let Some(p) = &probe {
+        let cropped_width = if matches!(project.layout, ClipLayout::Streamer { .. }) {
+            media::STREAMER_OUT_W
+        } else if let Some(p) = &probe {
             let iw = p.width.unwrap_or(1920) as f64;
             let ih = p.height.unwrap_or(1080) as f64;
             let w = (iw.min(ih * 9.0 / 16.0) / 2.0).floor() * 2.0;
@@ -587,6 +589,7 @@ async fn render_flat_clip_for_candidate(
             candidate.end_sec,
             &output_path,
             drawtext_filters.as_deref(),
+            &project.layout,
         ) {
             Ok(path) => {
                 let path_string = path.to_string_lossy().to_string();
@@ -611,6 +614,7 @@ async fn render_flat_clip_for_candidate(
                     candidate.end_sec,
                     &output_path,
                     None,
+                    &project.layout,
                 ) {
                     Ok(path) => {
                         let path_string = path.to_string_lossy().to_string();
@@ -640,6 +644,42 @@ async fn render_flat_clip_for_candidate(
                 }
             }
         }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn set_project_layout(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    layout: ClipLayout,
+) -> Result<Project, String> {
+    if let ClipLayout::Streamer { facecam } = &layout {
+        let values = [facecam.x, facecam.y, facecam.w, facecam.h];
+        if values.iter().any(|v| !v.is_finite()) || facecam.w <= 0.0 || facecam.h <= 0.0 {
+            return Err("Facecam area must have a positive width and height.".to_string());
+        }
+    }
+    state
+        .db
+        .set_project_layout(&project_id, &layout)
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+async fn extract_preview_frame(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    at_sec: Option<f64>,
+) -> Result<String, String> {
+    let project = state.db.get_project(&project_id).map_err(to_command_error)?;
+    tokio::task::spawn_blocking(move || {
+        // Default to a quarter of the way in: past intros and "starting soon" screens.
+        let at = at_sec
+            .or_else(|| project.source_duration.map(|d| (d * 0.25).min(600.0)))
+            .unwrap_or(5.0);
+        media::preview_frame_data_url(&project.source_path, at).map_err(to_command_error)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -689,6 +729,8 @@ pub fn run() {
             generate_candidates,
             set_selected_clip_count,
             render_flat_clip_for_candidate,
+            set_project_layout,
+            extract_preview_frame,
             delete_project,
             rename_project,
             check_youtube_copyright,

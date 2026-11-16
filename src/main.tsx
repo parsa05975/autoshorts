@@ -25,6 +25,7 @@ import {
   Youtube,
   AlertTriangle,
 } from "lucide-react";
+import { LayoutPanel, type ClipLayout } from "./LayoutPanel";
 import "./styles.css";
 
 type EnvironmentStatus = {
@@ -52,6 +53,7 @@ type Project = {
   status: string;
   transcriptionMode: string;
   captionStyle?: string | null;
+  layout: ClipLayout;
   createdAt: string;
   updatedAt: string;
 };
@@ -930,6 +932,22 @@ function App() {
                 <PipelineStep icon={<Captions size={16} />} label="Captions" done={selectedCount > 0 && selectedCaptionsCount === selectedCount} />
                 <PipelineStep icon={<Download size={16} />} label="Export" done={selectedCount > 0 && selectedCutCount === selectedCount} />
               </div>
+
+              <LayoutPanel
+                key={detail.project.id}
+                projectId={detail.project.id}
+                sourceDuration={detail.project.sourceDuration}
+                layout={detail.project.layout ?? { mode: "center" }}
+                disabled={busy === "cut"}
+                hasClips={detail.clips.some((clip) => clip.status === "done")}
+                onSaved={(layout) =>
+                  setDetail((current) =>
+                    current && current.project.id === detail.project.id
+                      ? { ...current, project: { ...current.project, layout } }
+                      : current,
+                  )
+                }
+              />
 
               <div className="work-grid">
                 <section className="panel transcript-panel">
