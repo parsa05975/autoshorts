@@ -25,7 +25,7 @@ import {
   Youtube,
   AlertTriangle,
 } from "lucide-react";
-import { LayoutPanel, type ClipLayout } from "./LayoutPanel";
+import { LayoutPanel, loadClipBranding, type ClipLayout } from "./LayoutPanel";
 import "./styles.css";
 
 type EnvironmentStatus = {
@@ -644,7 +644,7 @@ function App() {
     setBusy("cut");
     setError(null);
     try {
-      await invoke<string>("render_flat_clip_for_candidate", { candidateId });
+      await invoke<string>("render_flat_clip_for_candidate", { candidateId, branding: loadClipBranding(detail.project.id) });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -661,7 +661,10 @@ function App() {
     try {
       for (const candidate of selectedCandidates) {
         setRenderingCandidateId(candidate.id);
-        await invoke<string>("render_flat_clip_for_candidate", { candidateId: candidate.id });
+        await invoke<string>("render_flat_clip_for_candidate", {
+          candidateId: candidate.id,
+          branding: loadClipBranding(detail.project.id),
+        });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

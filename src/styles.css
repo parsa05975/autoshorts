@@ -1990,3 +1990,57 @@ button:disabled {
   font-style: normal;
   color: #ffe11a;
 }
+
+/* Watermark and AD label settings */
+.clip-extras {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border-color);
+}
+
+.clip-extras-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.clip-extras-field input,
+.clip-extras-field select {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.clip-extras-field input {
+  width: 220px;
+}
+
+.clip-extras-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.clip-extras-check input {
+  accent-color: var(--accent-primary);
+}
+
+.clip-extras-hint {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}

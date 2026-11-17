@@ -673,7 +673,9 @@ fn set_selected_clip_count(
 async fn render_flat_clip_for_candidate(
     state: tauri::State<'_, AppState>,
     candidate_id: String,
+    branding: Option<ClipBranding>,
 ) -> Result<String, String> {
+    let branding = branding.unwrap_or_default();
     let db = state.db.clone();
     let data_dir = state.data_dir.clone();
 
@@ -733,67 +735,67 @@ async fn render_flat_clip_for_candidate(
             }
         }
 
-        match media::render_flat_clip(
-            &project.source_path,
-            candidate.start_sec,
-            candidate.end_sec,
-            &output_path,
-            drawtext_filters.as_deref(),
-            &project.layout,
-        ) {
-            Ok(path) => {
-                let path_string = path.to_string_lossy().to_string();
-                let srt_string = srt_path.map(|p| p.to_string_lossy().to_string());
-                db
-                    .update_clip_for_candidate(
+        let clip_len = candidate.end_sec - candidate.start_sec;
+        let captions = drawtext_filters.unwrap_or_default();
+        let extras = build_branding_filters(&branding, cropped_width, clip_len);
+        let both = [captions.as_str(), extras.as_str()]
+            .into_iter()
+            .filter(|f| !f.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Try everything first; if FFmpeg rejects the text overlays, keep the watermark
+        // and drop the captions; as a last resort render the plain crop.
+        let attempts = [
+            (both, None),
+            (extras.clone(), Some("captions were skipped")),
+            (String::new(), Some("captions and watermark were skipped")),
+        ];
+        let mut tried: Vec<String> = Vec::new();
+        let mut first_error: Option<String> = None;
+        let mut last_error = String::new();
+        for (filters, skipped) in attempts {
+            if tried.contains(&filters) {
+                continue;
+            }
+            tried.push(filters.clone());
+            let overlays = (!filters.is_empty()).then_some(filters.as_str());
+            match media::render_flat_clip(
+                &project.source_path,
+                candidate.start_sec,
+                candidate.end_sec,
+                &output_path,
+                overlays,
+                &project.layout,
+            ) {
+                Ok(path) => {
+                    let path_string = path.to_string_lossy().to_string();
+                    let srt_string = srt_path.map(|p| p.to_string_lossy().to_string());
+                    let warning = match (skipped, &first_error) {
+                        (Some(what), Some(error)) => {
+                            Some(format!("Clip rendered successfully, but {what}. Error: {error}"))
+                        }
+                        _ => None,
+                    };
+                    db.update_clip_for_candidate(
                         &candidate_id,
                         "done",
                         Some(&path_string),
                         srt_string.as_deref(),
-                        None,
+                        warning.as_deref(),
                     )
                     .map_err(to_command_error)?;
-                Ok(path_string)
-            }
-            Err(error) => {
-                let err_msg = error.to_string();
-                // Fallback retry rendering without captions overlay on any error
-                match media::render_flat_clip(
-                    &project.source_path,
-                    candidate.start_sec,
-                    candidate.end_sec,
-                    &output_path,
-                    None,
-                    &project.layout,
-                ) {
-                    Ok(path) => {
-                        let path_string = path.to_string_lossy().to_string();
-                        let srt_string = srt_path.map(|p| p.to_string_lossy().to_string());
-                        let warning_msg = format!(
-                            "Clip rendered successfully, but captions were skipped. Error: {}",
-                            err_msg
-                        );
-                        db
-                            .update_clip_for_candidate(
-                                &candidate_id,
-                                "done",
-                                Some(&path_string),
-                                srt_string.as_deref(),
-                                Some(&warning_msg),
-                            )
-                            .map_err(to_command_error)?;
-                        Ok(path_string)
-                    }
-                    Err(retry_err) => {
-                        let message = retry_err.to_string();
-                        db
-                            .update_clip_for_candidate(&candidate_id, "error", None, None, Some(&message))
-                            .map_err(to_command_error)?;
-                        Err(message)
-                    }
+                    return Ok(path_string);
+                }
+                Err(error) => {
+                    last_error = to_command_error(error);
+                    first_error.get_or_insert_with(|| last_error.clone());
                 }
             }
         }
+        db.update_clip_for_candidate(&candidate_id, "error", None, None, Some(&last_error))
+            .map_err(to_command_error)?;
+        Err(last_error)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1139,6 +1141,76 @@ fn format_srt_time(start: f64, end: f64) -> String {
     format!("{} --> {}", format_time(start), format_time(end))
 }
 
+/// Extras burned into every clip, mainly for clipping campaigns.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipBranding {
+    /// Text shown in a corner for the whole clip, e.g. "@yourhandle".
+    #[serde(default)]
+    watermark: Option<String>,
+    /// "top-left", "top-right" (default), "bottom-left" or "bottom-right".
+    #[serde(default)]
+    watermark_corner: Option<String>,
+    /// Show an "AD" label at the start, as campaign briefs often require.
+    #[serde(default)]
+    ad_label: bool,
+}
+
+/// How long the "AD" label stays on screen.
+const AD_LABEL_SECS: f64 = 3.0;
+
+/// Watermark text as drawn: handle-safe characters only, so it can't break the filter.
+fn watermark_text(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter_map(|c| match c {
+            '\'' | '’' => Some('’'),
+            c if c.is_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | ' ' | '#') => Some(c),
+            _ => None,
+        })
+        .take(40)
+        .collect()
+}
+
+/// Drawtext filters for the watermark and the "AD" label. Positions stay clear of
+/// TikTok/Reels/Shorts UI: the top bar, the bottom caption area and the right-side buttons.
+fn build_branding_filters(branding: &ClipBranding, frame_width: i64, clip_len: f64) -> String {
+    let font_option = caption_font_path()
+        .map(|path| format!("fontfile='{}':", path.replace('\\', "/").replace('\'', "'\\''")))
+        .unwrap_or_default();
+    let width = frame_width.max(100) as f64;
+    let size = (width * 0.042).round().max(12.0);
+    let margin_x = format!("{:.0}", width * 0.05);
+    let corner = branding.watermark_corner.as_deref().unwrap_or("top-right");
+    let mut filters = Vec::new();
+
+    let text = branding.watermark.as_deref().map(watermark_text).unwrap_or_default();
+    if !text.is_empty() {
+        let x = if corner.ends_with("left") { margin_x.clone() } else { format!("w-text_w-{margin_x}") };
+        // Bottom corners sit above the caption/username area; top corners below the tab bar.
+        let y = if corner.starts_with("bottom") { "h*0.80-text_h".to_string() } else { "h*0.09".to_string() };
+        filters.push(format!(
+            "drawtext={font_option}text='{text}':fontsize={size:.0}:fontcolor=white@0.85:borderw={b:.0}:bordercolor=black@0.6:x={x}:y={y}",
+            b = (size * 0.08).max(1.0)
+        ));
+    }
+
+    if branding.ad_label && clip_len > 0.0 {
+        // Top-left, or just under the watermark when that is top-left too.
+        let y = if !text.is_empty() && corner == "top-left" {
+            format!("h*0.09+{:.0}", size * 1.8)
+        } else {
+            "h*0.09".to_string()
+        };
+        filters.push(format!(
+            "drawtext={font_option}text='AD':fontsize={size:.0}:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw={pad:.0}:x={margin_x}:y={y}:enable='between(t,0,{end:.3})'",
+            pad = (size * 0.3).max(4.0),
+            end = AD_LABEL_SECS.min(clip_len)
+        ));
+    }
+    filters.join(",")
+}
+
 /// Heaviest font available for captions. Black/Impact-style weights read best on phones.
 fn caption_font_path() -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
@@ -1320,6 +1392,30 @@ mod tests {
         assert!(parts[0].contains("fontsize='162*(0.75+0.25*min(1,(t-0.200)/0.1))'"));
         assert!(parts[2].contains("fontsize='186*"));
         assert!(parts[0].contains("x=(w-text_w)/2:y=(h-text_h)/2"));
+    }
+
+    #[test]
+    fn watermark_goes_in_the_chosen_corner_and_ad_label_shows_first() {
+        let branding = ClipBranding {
+            watermark: Some("@fullheatclips".into()),
+            watermark_corner: Some("top-right".into()),
+            ad_label: true,
+        };
+        let out = build_branding_filters(&branding, 1080, 30.0);
+        let parts: Vec<&str> = out.split(",drawtext=").collect();
+        assert_eq!(parts.len(), 2, "{out}");
+        assert!(parts[0].contains("text='@fullheatclips'") && parts[0].contains("x=w-text_w-54:y=h*0.09"));
+        assert!(parts[1].contains("text='AD'") && parts[1].contains("enable='between(t,0,3.000)'"));
+
+        let bottom_left = ClipBranding { watermark_corner: Some("bottom-left".into()), ad_label: false, ..branding };
+        let out = build_branding_filters(&bottom_left, 1080, 30.0);
+        assert!(out.contains("x=54:y=h*0.80-text_h") && !out.contains("'AD'"));
+    }
+
+    #[test]
+    fn watermark_text_cannot_break_the_filter() {
+        assert_eq!(watermark_text("  @full'heat:clips%{x}\\ "), "@full’heatclipsx");
+        assert!(build_branding_filters(&ClipBranding::default(), 1080, 30.0).is_empty());
     }
 
     #[test]

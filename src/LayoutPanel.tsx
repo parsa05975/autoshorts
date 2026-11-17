@@ -360,10 +360,112 @@ export function LayoutPanel({ projectId, sourceDuration, layout, disabled, hasCl
         </div>
       )}
 
+      <ClipExtras projectId={projectId} disabled={disabled} />
+
       {hasClips && saveState === "saved" && (
         <p className="layout-hint">Clips you already cut keep their old layout. Click Re-cut to update them.</p>
       )}
       {error && <div className="render-log">{error}</div>}
     </section>
+  );
+}
+
+export type WatermarkCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+
+/** What the render step burns into each clip, besides captions. */
+export type ClipBranding = {
+  watermark: string | null;
+  watermarkCorner: WatermarkCorner;
+  adLabel: boolean;
+};
+
+const WATERMARK_KEY = "autoshorts_watermark";
+const WATERMARK_CORNER_KEY = "autoshorts_watermark_corner";
+const DEFAULT_WATERMARK = "@fullheatclips";
+const adLabelKey = (projectId: string) => `autoshorts_ad_label_${projectId}`;
+
+function readSetting(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeSetting(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* settings are a convenience; rendering still works without them */
+  }
+}
+
+/** Current branding for a project: the watermark is shared, the AD label is per project. */
+export function loadClipBranding(projectId: string): ClipBranding {
+  const watermark = readSetting(WATERMARK_KEY) ?? DEFAULT_WATERMARK;
+  const corner = (readSetting(WATERMARK_CORNER_KEY) as WatermarkCorner | null) ?? "top-right";
+  return {
+    watermark: watermark.trim() ? watermark : null,
+    watermarkCorner: corner,
+    adLabel: readSetting(adLabelKey(projectId)) === "true",
+  };
+}
+
+/** Watermark and "AD" label settings, shown under the layout picker. */
+export function ClipExtras({ projectId, disabled }: { projectId: string; disabled: boolean }) {
+  const [watermark, setWatermark] = useState(() => readSetting(WATERMARK_KEY) ?? DEFAULT_WATERMARK);
+  const [corner, setCorner] = useState<WatermarkCorner>(
+    () => (readSetting(WATERMARK_CORNER_KEY) as WatermarkCorner | null) ?? "top-right",
+  );
+  const [adLabel, setAdLabel] = useState(() => readSetting(adLabelKey(projectId)) === "true");
+
+  useEffect(() => setAdLabel(readSetting(adLabelKey(projectId)) === "true"), [projectId]);
+
+  return (
+    <div className="clip-extras">
+      <label className="clip-extras-field">
+        <span>Watermark</span>
+        <input
+          value={watermark}
+          placeholder="@yourhandle (leave empty for none)"
+          maxLength={40}
+          disabled={disabled}
+          onChange={(event) => {
+            setWatermark(event.target.value);
+            writeSetting(WATERMARK_KEY, event.target.value);
+          }}
+        />
+      </label>
+      <label className="clip-extras-field">
+        <span>Corner</span>
+        <select
+          value={corner}
+          disabled={disabled}
+          onChange={(event) => {
+            const next = event.target.value as WatermarkCorner;
+            setCorner(next);
+            writeSetting(WATERMARK_CORNER_KEY, next);
+          }}
+        >
+          <option value="top-right">Top right</option>
+          <option value="top-left">Top left</option>
+          <option value="bottom-left">Bottom left</option>
+          <option value="bottom-right">Bottom right</option>
+        </select>
+      </label>
+      <label className="clip-extras-check" title="Shows 'AD' for the first 3 seconds. Many campaign briefs require it.">
+        <input
+          type="checkbox"
+          checked={adLabel}
+          disabled={disabled}
+          onChange={(event) => {
+            setAdLabel(event.target.checked);
+            writeSetting(adLabelKey(projectId), String(event.target.checked));
+          }}
+        />
+        <span>"AD" label for campaign clips (this project)</span>
+      </label>
+      <p className="clip-extras-hint">Applies to clips you cut or re-cut from now on.</p>
+    </div>
   );
 }
