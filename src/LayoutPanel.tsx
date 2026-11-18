@@ -361,6 +361,7 @@ export function LayoutPanel({ projectId, sourceDuration, layout, disabled, hasCl
       )}
 
       <ClipExtras projectId={projectId} disabled={disabled} />
+      <PostSettings projectId={projectId} disabled={disabled} />
 
       {hasClips && saveState === "saved" && (
         <p className="layout-hint">Clips you already cut keep their old layout. Click Re-cut to update them.</p>
@@ -466,6 +467,61 @@ export function ClipExtras({ projectId, disabled }: { projectId: string; disable
         <span>"AD" label for campaign clips (this project)</span>
       </label>
       <p className="clip-extras-hint">Applies to clips you cut or re-cut from now on.</p>
+    </div>
+  );
+}
+
+const streamerKey = (projectId: string) => `autoshorts_streamer_${projectId}`;
+const campaignTagsKey = (projectId: string) => `autoshorts_campaign_tags_${projectId}`;
+
+/** Who the clips are of and the hashtags the campaign requires; set per project. */
+export function loadPostSettings(projectId: string): { streamerName: string | null; requiredHashtags: string | null } {
+  const streamer = (readSetting(streamerKey(projectId)) ?? "").trim();
+  const tags = (readSetting(campaignTagsKey(projectId)) ?? "").trim();
+  return { streamerName: streamer || null, requiredHashtags: tags || null };
+}
+
+/** Streamer name and campaign hashtags used when AutoShorts writes post text. */
+export function PostSettings({ projectId, disabled }: { projectId: string; disabled: boolean }) {
+  const [streamer, setStreamer] = useState(() => readSetting(streamerKey(projectId)) ?? "");
+  const [tags, setTags] = useState(() => readSetting(campaignTagsKey(projectId)) ?? "");
+
+  useEffect(() => {
+    setStreamer(readSetting(streamerKey(projectId)) ?? "");
+    setTags(readSetting(campaignTagsKey(projectId)) ?? "");
+  }, [projectId]);
+
+  return (
+    <div className="clip-extras">
+      <label className="clip-extras-field">
+        <span>Streamer name</span>
+        <input
+          value={streamer}
+          placeholder="e.g. Lacy"
+          maxLength={40}
+          disabled={disabled}
+          onChange={(event) => {
+            setStreamer(event.target.value);
+            writeSetting(streamerKey(projectId), event.target.value);
+          }}
+        />
+      </label>
+      <label className="clip-extras-field">
+        <span>Campaign hashtags</span>
+        <input
+          value={tags}
+          placeholder="e.g. #LACY"
+          maxLength={80}
+          disabled={disabled}
+          onChange={(event) => {
+            setTags(event.target.value);
+            writeSetting(campaignTagsKey(projectId), event.target.value);
+          }}
+        />
+      </label>
+      <p className="clip-extras-hint">
+        Used for the title, caption and hashtags AutoShorts writes for each clip (this project).
+      </p>
     </div>
   );
 }

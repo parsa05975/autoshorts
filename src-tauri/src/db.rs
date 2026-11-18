@@ -438,6 +438,39 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Replaces a clip's post text. Each entry is (platform, title, caption, hashtags).
+    pub fn replace_clip_copy(
+        &self,
+        candidate_id: &str,
+        entries: &[(String, Option<String>, Option<String>, Option<String>)],
+    ) -> Result<Vec<ClipCopy>> {
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        let clip_id: String = conn
+            .query_row("SELECT id FROM clips WHERE candidate_id = ?1", params![candidate_id], |row| row.get(0))
+            .context("finding the clip for this candidate")?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM clip_copy WHERE clip_id = ?1", params![clip_id])?;
+        let mut saved = Vec::new();
+        for (platform, hook, caption, hashtags) in entries {
+            let copy = ClipCopy {
+                id: Uuid::new_v4().to_string(),
+                clip_id: clip_id.clone(),
+                platform: platform.clone(),
+                hook_text: hook.clone(),
+                caption_text: caption.clone(),
+                hashtags: hashtags.clone(),
+            };
+            tx.execute(
+                "INSERT INTO clip_copy (id, clip_id, platform, hook_text, caption_text, hashtags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![copy.id, copy.clip_id, copy.platform, copy.hook_text, copy.caption_text, copy.hashtags],
+            )?;
+            saved.push(copy);
+        }
+        tx.commit()?;
+        Ok(saved)
+    }
+
     fn list_copy_for_project(&self, project_id: &str) -> Result<Vec<ClipCopy>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
@@ -531,6 +564,22 @@ mod tests {
         db.update_clip_for_candidate(&candidate.id, "cutting", None, None, None).unwrap();
         db.update_clip_for_candidate(&candidate.id, "done", Some("a.mp4"), None, None).unwrap();
         assert_eq!(log_of(&db), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewriting_post_text_replaces_the_old_text() {
+        let dir = std::env::temp_dir().join(format!("autoshorts-db-{}", Uuid::new_v4()));
+        let db = Database::open(&dir.join("test.sqlite")).unwrap();
+        let project = db.create_project("C:/vod.mp4", "cloud", "tiktok", Some(3600.0)).unwrap();
+        let draft = CandidateDraft { start: 10.0, end: 40.0, score: 0.9, hook: "x".into(), rationale: "y".into() };
+        let candidate = db.replace_candidates(&project.id, &[draft]).unwrap().remove(0);
+        let entry = |p: &str, c: &str| (p.to_string(), Some("title".to_string()), Some(c.to_string()), Some("#LACY".to_string()));
+        db.replace_clip_copy(&candidate.id, &[entry("post", "first"), entry("alt-1", "alt")]).unwrap();
+        db.replace_clip_copy(&candidate.id, &[entry("post", "second")]).unwrap();
+        let copy = db.project_detail(&project.id).unwrap().copy;
+        assert_eq!(copy.len(), 1);
+        assert_eq!(copy[0].caption_text.as_deref(), Some("second"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

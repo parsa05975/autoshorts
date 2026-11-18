@@ -589,55 +589,7 @@ async fn generate_candidates(
         .await
         .unwrap_or_default();
 
-    let active_provider = provider
-        .or_else(|| std::env::var("LLM_PROVIDER").ok())
-        .unwrap_or_else(|| "deepseek".to_string())
-        .to_lowercase();
-
-    let choice = match active_provider.as_str() {
-        "claude" => {
-            let key = api_key
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .ok_or_else(|| "Set ANTHROPIC_API_KEY or supply Claude API Key to generate candidates.".to_string())?;
-            llm::LlmChoice::Claude { api_key: key }
-        }
-        "local" | "ollama" => {
-            let model = model_name
-                .or_else(|| std::env::var("OLLAMA_MODEL").ok())
-                .unwrap_or_else(|| "llama3.2".to_string());
-            llm::LlmChoice::Local { model }
-        }
-        "gemini" => {
-            let key = api_key
-                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-                .ok_or_else(|| "Set GEMINI_API_KEY or supply Gemini API Key to generate candidates.".to_string())?;
-            llm::LlmChoice::Gemini { api_key: key }
-        }
-        "openai" => {
-            let key = api_key
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .ok_or_else(|| "Set OPENAI_API_KEY or supply OpenAI API Key to generate candidates.".to_string())?;
-            llm::LlmChoice::OpenAi { api_key: key }
-        }
-        "openrouter" => {
-            let key = api_key
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .ok_or_else(|| "Set OPENROUTER_API_KEY or supply OpenRouter API Key to generate candidates.".to_string())?;
-            llm::LlmChoice::OpenRouter { api_key: key, model: model_name }
-        }
-        "groq" => {
-            let key = api_key
-                .or_else(|| std::env::var("GROQ_API_KEY").ok())
-                .ok_or_else(|| "Set GROQ_API_KEY or supply Groq API Key to generate candidates.".to_string())?;
-            llm::LlmChoice::Groq { api_key: key }
-        }
-        _ => {
-            let key = api_key
-                .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
-                .ok_or_else(|| "Set DEEPSEEK_API_KEY or supply DeepSeek API Key to generate candidates.".to_string())?;
-            llm::LlmChoice::DeepSeek { api_key: key, model: model_name }
-        }
-    };
+    let choice = llm_choice(provider, api_key, model_name)?;
 
     let drafts = llm::detect_candidates(&choice, &normalized, &spikes, |done, total| {
         emit_progress(&app, &project_id, "analyze", done, total)
@@ -655,6 +607,114 @@ async fn generate_candidates(
     db.update_project_status(&project_id, "ready", None)
         .map_err(to_command_error)?;
     Ok(candidates)
+}
+
+/// The AI to use, from the app's settings (falling back to environment variables).
+fn llm_choice(
+    provider: Option<String>,
+    api_key: Option<String>,
+    model_name: Option<String>,
+) -> Result<llm::LlmChoice, String> {
+    let active_provider = provider
+        .or_else(|| std::env::var("LLM_PROVIDER").ok())
+        .unwrap_or_else(|| "deepseek".to_string())
+        .to_lowercase();
+
+    let choice = match active_provider.as_str() {
+        "claude" => {
+            let key = api_key
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .ok_or_else(|| "Set ANTHROPIC_API_KEY or supply Claude API Key in API Settings.".to_string())?;
+            llm::LlmChoice::Claude { api_key: key }
+        }
+        "local" | "ollama" => {
+            let model = model_name
+                .or_else(|| std::env::var("OLLAMA_MODEL").ok())
+                .unwrap_or_else(|| "llama3.2".to_string());
+            llm::LlmChoice::Local { model }
+        }
+        "gemini" => {
+            let key = api_key
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .ok_or_else(|| "Set GEMINI_API_KEY or supply Gemini API Key in API Settings.".to_string())?;
+            llm::LlmChoice::Gemini { api_key: key }
+        }
+        "openai" => {
+            let key = api_key
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .ok_or_else(|| "Set OPENAI_API_KEY or supply OpenAI API Key in API Settings.".to_string())?;
+            llm::LlmChoice::OpenAi { api_key: key }
+        }
+        "openrouter" => {
+            let key = api_key
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                .ok_or_else(|| "Set OPENROUTER_API_KEY or supply OpenRouter API Key in API Settings.".to_string())?;
+            llm::LlmChoice::OpenRouter { api_key: key, model: model_name }
+        }
+        "groq" => {
+            let key = api_key
+                .or_else(|| std::env::var("GROQ_API_KEY").ok())
+                .ok_or_else(|| "Set GROQ_API_KEY or supply Groq API Key in API Settings.".to_string())?;
+            llm::LlmChoice::Groq { api_key: key }
+        }
+        _ => {
+            let key = api_key
+                .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+                .ok_or_else(|| "Set DEEPSEEK_API_KEY or supply DeepSeek API Key in API Settings.".to_string())?;
+            llm::LlmChoice::DeepSeek { api_key: key, model: model_name }
+        }
+    };
+
+    Ok(choice)
+}
+
+/// Writes the post text (title, caption, hashtags, alternatives) for one clip and saves it.
+#[tauri::command]
+async fn write_post_copy(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+    provider: Option<String>,
+    api_key: Option<String>,
+    model_name: Option<String>,
+    streamer_name: Option<String>,
+    required_hashtags: Option<String>,
+) -> Result<Vec<models::ClipCopy>, String> {
+    let db = state.db.clone();
+    let (candidate, project) = db.get_candidate_with_project(&candidate_id).map_err(to_command_error)?;
+    let choice = llm_choice(provider, api_key, model_name)?;
+
+    // The clip's own words, timed from the start of the clip.
+    let transcript = db
+        .latest_transcript(&project.id)
+        .map_err(to_command_error)?
+        .and_then(|t| serde_json::from_str::<NormalizedTranscript>(&t.raw_json).ok())
+        .map(|t| {
+            t.segments
+                .iter()
+                .filter(|s| s.end > candidate.start_sec && s.start < candidate.end_sec)
+                .map(|s| format!("[{:.0}s] {}", (s.start - candidate.start_sec).max(0.0), s.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let required = llm::parse_hashtags(required_hashtags.as_deref().unwrap_or(""));
+    let request = llm::PostCopyRequest {
+        streamer: streamer_name.as_deref(),
+        required_hashtags: &required,
+        clip_title: &candidate.hook,
+        clip_summary: &candidate.rationale,
+        duration_secs: candidate.end_sec - candidate.start_sec,
+        transcript: &transcript,
+    };
+    let copy = llm::write_post_copy(&choice, &request).await.map_err(to_command_error)?;
+
+    let tags = Some(copy.hashtags.clone());
+    let mut entries = vec![("post".to_string(), Some(copy.title.clone()), Some(copy.caption.clone()), tags.clone())];
+    for (i, alternative) in copy.alternatives.iter().enumerate() {
+        entries.push((format!("alt-{}", i + 1), None, Some(alternative.clone()), tags.clone()));
+    }
+    db.replace_clip_copy(&candidate_id, &entries).map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -883,6 +943,7 @@ pub fn run() {
             render_flat_clip_for_candidate,
             set_project_layout,
             extract_preview_frame,
+            write_post_copy,
             delete_project,
             rename_project,
             check_youtube_copyright,

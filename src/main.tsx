@@ -25,7 +25,7 @@ import {
   Youtube,
   AlertTriangle,
 } from "lucide-react";
-import { LayoutPanel, loadClipBranding, type ClipLayout } from "./LayoutPanel";
+import { LayoutPanel, loadClipBranding, loadPostSettings, type ClipLayout } from "./LayoutPanel";
 import "./styles.css";
 
 type EnvironmentStatus = {
@@ -96,12 +96,114 @@ type PipelineProgress = {
   total: number;
 };
 
+type ClipCopy = {
+  id: string;
+  clipId: string;
+  /** "post" for the main text, "alt-1", "alt-2"… for alternative hooks. */
+  platform: string;
+  hookText: string | null;
+  captionText: string | null;
+  hashtags: string | null;
+};
+
 type ProjectDetail = {
   project: Project;
   transcript: Transcript | null;
   candidates: Candidate[];
   clips: Clip[];
+  copy: ClipCopy[];
 };
+
+/** Copies text to the clipboard, with a fallback for webviews without the Clipboard API. */
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+}
+
+function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="post-copy-button"
+      onClick={() => {
+        void copyText(text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        });
+      }}
+    >
+      {copied ? <Check size={12} /> : <Copy size={12} />}
+      {copied ? "Copied" : label}
+    </button>
+  );
+}
+
+/** The title, caption and alternatives AutoShorts wrote for one clip. */
+function PostCopyBox({
+  copy,
+  writing,
+  error,
+  onRewrite,
+  disabled,
+}: {
+  copy: ClipCopy[];
+  writing: boolean;
+  error: string | null;
+  onRewrite: () => void;
+  disabled: boolean;
+}) {
+  const main = copy.find((c) => c.platform === "post");
+  const alternatives = copy.filter((c) => c.platform.startsWith("alt-")).sort((a, b) => a.platform.localeCompare(b.platform));
+  const withTags = (line: string | null, tags: string | null) => [line ?? "", tags ?? ""].filter(Boolean).join("\n");
+
+  return (
+    <div className="post-copy">
+      <div className="post-copy-heading">
+        <strong>Post text</strong>
+        <button type="button" className="post-copy-button" onClick={onRewrite} disabled={disabled || writing}>
+          {writing ? <Loader2 className="spin" size={12} /> : <Wand2 size={12} />}
+          {writing ? "Writing…" : main ? "Rewrite" : "Write"}
+        </button>
+      </div>
+      {error && <div className="render-log">{error}</div>}
+      {main && (
+        <>
+          <div className="post-copy-row">
+            <span className="post-copy-label">YouTube title</span>
+            <p>{main.hookText}</p>
+            <CopyButton text={main.hookText ?? ""} />
+          </div>
+          <div className="post-copy-row">
+            <span className="post-copy-label">Caption (TikTok, IG, X, Shorts description)</span>
+            <p>
+              {main.captionText}
+              <br />
+              <span className="post-copy-tags">{main.hashtags}</span>
+            </p>
+            <CopyButton text={withTags(main.captionText, main.hashtags)} />
+          </div>
+          {alternatives.map((alt, i) => (
+            <div className="post-copy-row alt" key={alt.id}>
+              <span className="post-copy-label">Alternative {i + 1}</span>
+              <p>{alt.captionText}</p>
+              <CopyButton text={withTags(alt.captionText, alt.hashtags)} />
+            </div>
+          ))}
+        </>
+      )}
+      {!main && !writing && !error && <p className="post-copy-empty">Written automatically after the clip is cut.</p>}
+    </div>
+  );
+}
 
 type NormalizedTranscript = {
   language: string;
@@ -133,6 +235,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [renderingCandidateId, setRenderingCandidateId] = useState<string | null>(null);
+  const [writingCopyIds, setWritingCopyIds] = useState<Set<string>>(new Set());
+  const [copyErrors, setCopyErrors] = useState<Record<string, string>>({});
   const [showStyleModal, setShowStyleModal] = useState(false);
   const [selectedStyle, setSelectedStyle] = useState("tiktok");
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
@@ -591,6 +695,48 @@ function App() {
     });
   }
 
+  /** The AI provider, key and model from the settings, as the backend commands expect them. */
+  function llmArgs() {
+    const apiKey =
+      llmEngine === "claude" ? anthropicKey.trim() :
+        llmEngine === "deepseek" ? deepseekKey.trim() :
+          llmEngine === "gemini" ? geminiKey.trim() :
+            llmEngine === "openai" ? openaiKey.trim() :
+              llmEngine === "openrouter" ? openrouterKey.trim() :
+                llmEngine === "groq" ? groqKey.trim() : "";
+    const modelName =
+      llmEngine === "local" ? localLlmModel.trim() :
+        llmEngine === "deepseek" ? (deepseekModel.trim() || null) :
+          llmEngine === "openrouter" ? (openrouterModel.trim() || null) : null;
+    return { apiKey: apiKey || null, provider: llmEngine, modelName };
+  }
+
+  /** Writes (or rewrites) the post text for one clip. Failures are shown on the clip, not as a page error. */
+  async function writePostCopy(projectId: string, candidateId: string) {
+    setWritingCopyIds((ids) => new Set(ids).add(candidateId));
+    setCopyErrors(({ [candidateId]: _, ...rest }) => rest);
+    try {
+      const copy = await invoke<ClipCopy[]>("write_post_copy", {
+        candidateId,
+        ...llmArgs(),
+        ...loadPostSettings(projectId),
+      });
+      setDetail((current) => {
+        if (!current || current.project.id !== projectId || copy.length === 0) return current;
+        const clipId = copy[0].clipId;
+        return { ...current, copy: [...current.copy.filter((c) => c.clipId !== clipId), ...copy] };
+      });
+    } catch (err) {
+      setCopyErrors((errors) => ({ ...errors, [candidateId]: `Couldn't write post text: ${String(err)}` }));
+    } finally {
+      setWritingCopyIds((ids) => {
+        const next = new Set(ids);
+        next.delete(candidateId);
+        return next;
+      });
+    }
+  }
+
   async function moments(allowDemo: boolean) {
     if (!detail) return;
     await run("moments", async () => {
@@ -643,8 +789,10 @@ function App() {
     setRenderingCandidateId(candidateId);
     setBusy("cut");
     setError(null);
+    let cut = false;
     try {
       await invoke<string>("render_flat_clip_for_candidate", { candidateId, branding: loadClipBranding(detail.project.id) });
+      cut = true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -652,6 +800,7 @@ function App() {
       setBusy("idle");
       await refresh(detail.project.id);
     }
+    if (cut) await writePostCopy(detail.project.id, candidateId);
   }
 
   async function cutSelected() {
@@ -659,13 +808,18 @@ function App() {
     setBusy("cut");
     setError(null);
     try {
+      const projectId = detail.project.id;
+      const writing: Promise<void>[] = [];
       for (const candidate of selectedCandidates) {
         setRenderingCandidateId(candidate.id);
         await invoke<string>("render_flat_clip_for_candidate", {
           candidateId: candidate.id,
-          branding: loadClipBranding(detail.project.id),
+          branding: loadClipBranding(projectId),
         });
+        // Write this clip's post text while the next clip renders.
+        writing.push(writePostCopy(projectId, candidate.id));
       }
+      await Promise.all(writing);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1126,6 +1280,15 @@ function App() {
                               </div>
                             )}
                             {clip?.renderLog && <div className="render-log">{clip.renderLog}</div>}
+                            {isCut && clip && (
+                              <PostCopyBox
+                                copy={detail.copy.filter((c) => c.clipId === clip.id)}
+                                writing={writingCopyIds.has(candidate.id)}
+                                error={copyErrors[candidate.id] ?? null}
+                                onRewrite={() => void writePostCopy(detail.project.id, candidate.id)}
+                                disabled={busy !== "idle" && busy !== "cut"}
+                              />
+                            )}
                           </div>
                         </article>
                       );

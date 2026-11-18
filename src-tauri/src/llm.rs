@@ -388,13 +388,48 @@ async fn ask_local_llm(
     prompt: &MomentPrompt,
     model_name: &str,
 ) -> Result<String> {
-    let system_instructions = format!(
-        "{MOMENT_INSTRUCTIONS}\n\n\
+    let system_instructions = match prompt.kind {
+        PromptKind::Moments => format!(
+            "{MOMENT_INSTRUCTIONS}\n\n\
 REMINDERS FOR THIS MODEL: Each clip MUST last between 20 and 60 seconds (end minus start). \
 Combine adjacent transcript lines to reach that length. Return at least 3 candidates; never an empty list. \
 start and end must be real timestamps from the transcript, never 0.0 for both."
-    );
+        ),
+        PromptKind::PostCopy => POST_COPY_INSTRUCTIONS.to_string(),
+    };
     let user_content = prompt.input.clone();
+    let format = match prompt.kind {
+        PromptKind::Moments => json!({
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": { "type": "number" },
+                            "end": { "type": "number" },
+                            "score": { "type": "number" },
+                            "hook": { "type": "string" },
+                            "rationale": { "type": "string" }
+                        },
+                        "required": ["start", "end", "score", "hook", "rationale"]
+                    }
+                }
+            },
+            "required": ["candidates"]
+        }),
+        PromptKind::PostCopy => json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "caption": { "type": "string" },
+                "hashtags": { "type": "string" },
+                "alternatives": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["title", "caption", "hashtags", "alternatives"]
+        }),
+    };
 
     let response = reqwest::Client::new()
         .post("http://localhost:11434/api/chat")
@@ -415,26 +450,7 @@ start and end must be real timestamps from the transcript, never 0.0 for both."
                 "temperature": 0.2,
                 "num_ctx": 16384
             },
-            "format": {
-                "type": "object",
-                "properties": {
-                    "candidates": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start": { "type": "number" },
-                                "end": { "type": "number" },
-                                "score": { "type": "number" },
-                                "hook": { "type": "string" },
-                                "rationale": { "type": "string" }
-                            },
-                            "required": ["start", "end", "score", "hook", "rationale"]
-                        }
-                    }
-                },
-                "required": ["candidates"]
-            }
+            "format": format
         }))
         .send()
         .await
@@ -547,16 +563,33 @@ impl LlmChoice {
     }
 }
 
-/// The two halves of a request: fixed instructions and this part's data.
+/// What a request asks the AI for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PromptKind {
+    /// Find clip-worthy moments in part of a stream.
+    Moments,
+    /// Write the post text (title, caption, hashtags) for one finished clip.
+    PostCopy,
+}
+
+/// The two halves of a request: fixed instructions and this request's data.
 #[derive(Debug, Clone)]
 struct MomentPrompt {
+    kind: PromptKind,
     input: String,
 }
 
 impl MomentPrompt {
+    fn instructions(&self) -> &'static str {
+        match self.kind {
+            PromptKind::Moments => MOMENT_INSTRUCTIONS,
+            PromptKind::PostCopy => POST_COPY_INSTRUCTIONS,
+        }
+    }
+
     /// Instructions and data as one message, for providers that take a single prompt.
     fn combined(&self) -> String {
-        format!("{MOMENT_INSTRUCTIONS}\n\n{}", self.input)
+        format!("{}\n\n{}", self.instructions(), self.input)
     }
 }
 
@@ -619,7 +652,10 @@ pub async fn detect_candidates(
     loop {
         while running.len() < llm.concurrency() {
             let Some(window) = pending.next() else { break };
-            let prompt = MomentPrompt { input: moment_input(transcript, spikes, duration, window, total) };
+            let prompt = MomentPrompt {
+                kind: PromptKind::Moments,
+                input: moment_input(transcript, spikes, duration, window, total),
+            };
             let llm = llm.clone();
             running.spawn(async move {
                 let mut last_error = anyhow!("no attempt made");
@@ -953,6 +989,261 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
     Ok(candidates)
 }
 
+/// Instructions for writing one clip's post text. These encode what worked when
+/// writing captions by hand: quote the streamer, stay specific, stay reach-safe.
+const POST_COPY_INSTRUCTIONS: &str = "You write the post text for one short vertical clip from a GTA 6 livestream. \
+The same text is used on TikTok, Instagram Reels, YouTube Shorts and X.
+
+You get the streamer's name, the hashtags the clipping campaign requires, the clip picker's title and summary, \
+and the exact transcript of the clip with timestamps in seconds from the start of the clip.
+
+RULES:
+1. Lead with the most specific, surprising thing that happens in the clip. Generic lines like \"crazy moment\" are a last resort.
+2. If the streamer says something funny or memorable, quote it word for word in double quotes. A good quote is the best hook.
+3. Only describe what the transcript or summary supports. Never invent events, numbers (wanted stars, kill counts, prices) \
+or character names. If you cannot tell what happens, write a curiosity hook instead.
+4. Use the streamer's name. Do not refer to the streamer as he, she or they.
+5. If something is a story cutscene (for example a character getting arrested in a scene), do not say the streamer caused it.
+6. Keep it reach-safe: censor swear words with an asterisk, even inside quotes (sh*t, f*ck). Outside quotes avoid words \
+platforms punish: say \"stash\" or \"white powder\" instead of drug names, \"takes out\" instead of kill, and never \"naked\" or \"nude\".
+7. One to three emojis at the end of the hook line, from common gaming ones such as 💀 😭 🔥 😤 🚔 🍔 💰.
+8. Hashtags: the required ones first, then #GTA6 #GTAVI, then #gaming or #streamer. Add a GTA 6 character hashtag \
+(for example #Lucia or #Jason) only if that character is in the transcript or summary. Four to six hashtags in total.
+
+Write:
+- title: the YouTube Shorts title, at most 90 characters, containing the streamer's name and the first required hashtag.
+- caption: the hook line for TikTok, Instagram and X, at most 120 characters, containing the streamer's name, without hashtags.
+- hashtags: the hashtags as one space-separated string.
+- alternatives: two other hook lines in different styles (for example one with a quote, one a POV or curiosity line), without hashtags.
+
+Return JSON in exactly this shape:
+{\"title\":\"...\",\"caption\":\"...\",\"hashtags\":\"#A #B\",\"alternatives\":[\"...\",\"...\"]}";
+
+/// YouTube's limit for a video title.
+const MAX_TITLE_CHARS: usize = 100;
+
+/// Post text for one clip, ready to paste.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostCopy {
+    pub title: String,
+    pub caption: String,
+    pub hashtags: String,
+    pub alternatives: Vec<String>,
+}
+
+/// What the AI is told about the clip it writes for.
+pub struct PostCopyRequest<'a> {
+    pub streamer: Option<&'a str>,
+    pub required_hashtags: &'a [String],
+    pub clip_title: &'a str,
+    pub clip_summary: &'a str,
+    pub duration_secs: f64,
+    /// Transcript lines, timed from the start of the clip.
+    pub transcript: &'a str,
+}
+
+/// Turns "#LACY, lacy  #GTA6" into ["#LACY", "#lacy", "#GTA6"].
+pub fn parse_hashtags(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == ',')
+        .map(|t| t.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '#')))
+        .map(|t| t.trim_start_matches('#'))
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("#{t}"))
+        .collect()
+}
+
+/// Stars out swear words (and fully masks slurs), keeping the first letter readable.
+pub fn censor(text: &str) -> String {
+    // (word, replacement); matched case-insensitively.
+    const WORDS: &[(&str, &str)] = &[
+        ("motherfucker", "motherf*cker"),
+        ("fucking", "f*cking"),
+        ("fucked", "f*cked"),
+        ("fuck", "f*ck"),
+        ("shit", "sh*t"),
+        ("bitch", "b*tch"),
+        ("asshole", "a**hole"),
+        ("cunt", "c*nt"),
+        ("pussy", "p*ssy"),
+        ("nigger", "n*****"),
+        ("nigga", "n****"),
+    ];
+    let mut out = text.to_string();
+    for (word, replacement) in WORDS {
+        let mut result = String::with_capacity(out.len());
+        let lower = out.to_ascii_lowercase();
+        let mut last = 0;
+        for (start, _) in lower.match_indices(word) {
+            if start < last {
+                continue;
+            }
+            result.push_str(&out[last..start]);
+            let original = &out[start..start + word.len()];
+            // Keep the original capitalisation of the first letter ("Shit" -> "Sh*t").
+            let mut rep = replacement.to_string();
+            if original.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                rep = rep[..1].to_ascii_uppercase() + &rep[1..];
+            }
+            if original.chars().all(|c| !c.is_ascii_lowercase()) {
+                rep = rep.to_ascii_uppercase();
+            }
+            result.push_str(&rep);
+            last = start + word.len();
+        }
+        result.push_str(&out[last..]);
+        out = result;
+    }
+    out
+}
+
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// Cuts text to `max` characters at a word boundary.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    match cut.rfind(' ') {
+        Some(i) if i > max / 2 => cut[..i].trim_end().to_string(),
+        _ => cut,
+    }
+}
+
+/// Applies the rules the app guarantees regardless of what the AI returned: swear words
+/// starred, streamer named, required hashtags present (and first), title within limits.
+fn finalize_post_copy(raw: PostCopy, streamer: Option<&str>, required: &[String]) -> PostCopy {
+    let streamer = streamer.map(str::trim).filter(|s| !s.is_empty());
+
+    // Hashtags the AI left inside the hook lines move to the hashtag list.
+    let mut found_tags = parse_hashtags(&raw.hashtags);
+    let mut strip = |line: &str| -> String {
+        let mut kept = Vec::new();
+        for word in line.split_whitespace() {
+            if word.starts_with('#') && word.len() > 1 {
+                found_tags.extend(parse_hashtags(word));
+            } else {
+                kept.push(word);
+            }
+        }
+        kept.join(" ")
+    };
+    let caption = strip(&raw.caption);
+    let alternatives: Vec<String> = raw.alternatives.iter().map(|a| strip(a)).collect();
+
+    let name_it = |line: String| -> String {
+        match streamer {
+            Some(name) if !line.is_empty() && !contains_ignore_case(&line, name) => format!("{name}: {line}"),
+            _ => line,
+        }
+    };
+    let caption = name_it(censor(caption.trim()));
+    let alternatives: Vec<String> = alternatives
+        .into_iter()
+        .map(|a| name_it(censor(a.trim())))
+        .filter(|a| !a.is_empty() && *a != caption)
+        .take(3)
+        .collect();
+
+    // Required tags first, then the AI's, then the GTA 6 basics; no duplicates.
+    let mut tags: Vec<String> = Vec::new();
+    for tag in required
+        .iter()
+        .cloned()
+        .chain(found_tags)
+        .chain(["#GTA6".to_string(), "#GTAVI".to_string()])
+    {
+        if !tags.iter().any(|t| t.eq_ignore_ascii_case(&tag)) {
+            tags.push(tag);
+        }
+    }
+    let keep = tags.len().min(required.len().max(6));
+    let hashtags = tags[..keep].join(" ");
+
+    let mut title = censor(raw.title.trim());
+    if title.is_empty() {
+        title = caption.clone();
+    }
+    let (body, title_tags): (Vec<&str>, Vec<&str>) = title.split_whitespace().partition(|w| !w.starts_with('#'));
+    let mut title = name_it(body.join(" "));
+    let mut wanted: Vec<String> = title_tags.into_iter().map(str::to_string).collect();
+    if let Some(first) = required.first() {
+        if !wanted.iter().any(|t| t.eq_ignore_ascii_case(first)) {
+            wanted.insert(0, first.clone());
+        }
+    }
+    let tag_text = wanted.join(" ");
+    let room = MAX_TITLE_CHARS.saturating_sub(tag_text.chars().count() + 1);
+    title = truncate_chars(&title, room);
+    if !tag_text.is_empty() {
+        title = format!("{title} {tag_text}");
+    }
+    let title = truncate_chars(&title, MAX_TITLE_CHARS);
+
+    PostCopy { title, caption, hashtags, alternatives }
+}
+
+fn parse_post_copy(text: &str) -> Result<PostCopy> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let value: serde_json::Value = serde_json::from_str(trimmed).context("parsing post text JSON")?;
+    let field = |name: &str| value.get(name).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let hashtags = match value.get("hashtags") {
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "),
+        _ => field("hashtags"),
+    };
+    let alternatives = value
+        .get("alternatives")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let copy = PostCopy { title: field("title"), caption: field("caption"), hashtags, alternatives };
+    if copy.caption.trim().is_empty() && copy.title.trim().is_empty() {
+        return Err(anyhow!("the AI returned no caption: {trimmed}"));
+    }
+    Ok(copy)
+}
+
+fn post_copy_input(request: &PostCopyRequest) -> String {
+    let required = if request.required_hashtags.is_empty() {
+        "(none)".to_string()
+    } else {
+        request.required_hashtags.join(" ")
+    };
+    format!(
+        "STREAMER: {}\nREQUIRED HASHTAGS: {required}\nCLIP LENGTH: {:.0} seconds\n\
+CLIP PICKER'S TITLE: {}\nCLIP PICKER'S SUMMARY: {}\n\nTRANSCRIPT OF THE CLIP:\n{}",
+        request.streamer.filter(|s| !s.trim().is_empty()).unwrap_or("(unknown: describe them as \"the streamer\")"),
+        request.duration_secs,
+        request.clip_title,
+        request.clip_summary,
+        if request.transcript.trim().is_empty() { "(no speech in this clip)" } else { request.transcript },
+    )
+}
+
+/// Writes the post text for one clip: title, caption, hashtags and alternative hooks.
+pub async fn write_post_copy(llm: &LlmChoice, request: &PostCopyRequest<'_>) -> Result<PostCopy> {
+    let prompt = MomentPrompt { kind: PromptKind::PostCopy, input: post_copy_input(request) };
+    let mut last_error = anyhow!("no attempt made");
+    for attempt in 0..ANALYSIS_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64)).await;
+        }
+        match llm.ask(&prompt).await.and_then(|text| parse_post_copy(&text)) {
+            Ok(raw) => return Ok(finalize_post_copy(raw, request.streamer, request.required_hashtags)),
+            Err(error) if error.to_string().to_lowercase().contains("not found") => return Err(error),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,7 +1281,7 @@ mod tests {
         assert!(input.contains("[200.00-203.50] Speaker: NO NO NO <LOUD +17dB>"));
         // Other parts' lines and spikes stay out of this part's prompt.
         assert!(!input.contains("later on") && !input.contains("5001.0"));
-        let prompt = MomentPrompt { input }.combined();
+        let prompt = MomentPrompt { kind: PromptKind::Moments, input }.combined();
         assert!(prompt.starts_with("You are the clip editor for a GTA 6"));
     }
 
@@ -1041,5 +1332,58 @@ mod tests {
         ]}"#;
         let parsed = parse_candidate_json(answer, MIN_CLIP_SECONDS).unwrap();
         assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn swear_words_are_starred_and_slurs_masked() {
+        assert_eq!(censor("I walk shit down"), "I walk sh*t down");
+        assert_eq!(censor("Shit, FUCK this"), "Sh*t, F*CK this");
+        assert_eq!(censor("a fucking clue 💀"), "a f*cking clue 💀");
+        assert_eq!(censor("Shitake mushrooms"), "Sh*take mushrooms"); // accepted false positive
+        assert_eq!(censor("nothing to see"), "nothing to see");
+    }
+
+    #[test]
+    fn hashtags_are_parsed_loosely() {
+        assert_eq!(parse_hashtags("#LACY, lacy  #GTA6 #"), vec!["#LACY", "#lacy", "#GTA6"]);
+    }
+
+    #[test]
+    fn post_copy_always_names_the_streamer_and_keeps_required_tags() {
+        let raw = PostCopy {
+            title: "He said I walk shit down".into(),
+            caption: "\"I walk shit down\" 😤 wasn't playing #gta6".into(),
+            hashtags: "#GTA6 #gaming".into(),
+            alternatives: vec!["3 dudes vs one streamer 💀".into(), "Lacy said it and meant it".into()],
+        };
+        let out = finalize_post_copy(raw, Some("Lacy"), &["#LACY".to_string()]);
+        assert_eq!(out.caption, "Lacy: \"I walk sh*t down\" 😤 wasn't playing");
+        assert!(out.hashtags.starts_with("#LACY #GTA6"), "{}", out.hashtags);
+        assert!(!out.hashtags.to_lowercase().matches("#gta6").nth(1).is_some(), "duplicate tag: {}", out.hashtags);
+        assert!(out.title.starts_with("Lacy: He said I walk sh*t down") && out.title.ends_with("#LACY"), "{}", out.title);
+        assert_eq!(out.alternatives[0], "Lacy: 3 dudes vs one streamer 💀");
+        assert_eq!(out.alternatives[1], "Lacy said it and meant it");
+    }
+
+    #[test]
+    fn long_titles_fit_youtube_limit_with_the_tag_kept() {
+        let raw = PostCopy {
+            title: "Lacy ".to_string() + &"really long words ".repeat(12),
+            caption: "Lacy 🔥".into(),
+            hashtags: String::new(),
+            alternatives: vec![],
+        };
+        let out = finalize_post_copy(raw, Some("Lacy"), &["#LACY".to_string()]);
+        assert!(out.title.chars().count() <= MAX_TITLE_CHARS, "{}", out.title.chars().count());
+        assert!(out.title.ends_with("#LACY"));
+    }
+
+    #[test]
+    fn post_copy_json_is_parsed_even_with_fences_and_array_hashtags() {
+        let text = "```json\n{\"title\":\"t\",\"caption\":\"c\",\"hashtags\":[\"#A\",\"#B\"],\"alternatives\":[\"x\"]}\n```";
+        let copy = parse_post_copy(text).unwrap();
+        assert_eq!(copy.hashtags, "#A #B");
+        assert_eq!(copy.alternatives, vec!["x"]);
+        assert!(parse_post_copy("{\"title\":\"\",\"caption\":\"\"}").is_err());
     }
 }
