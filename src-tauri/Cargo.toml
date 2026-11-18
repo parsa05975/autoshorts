@@ -1,6 +1,6 @@
 [package]
 name = "autoshorts"
-version = "0.1.9"
+version = "0.1.10"
 description = "Local-first long-form to short-form clip studio"
 authors = ["AutoShorts"]
 edition = "2021"
