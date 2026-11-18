@@ -849,7 +849,7 @@ function App() {
                           <input
                             value={deepseekModel}
                             onChange={(event) => setDeepseekModel(event.target.value)}
-                            placeholder="Optional (e.g. deepseek-chat, deepseek-v4-pro)"
+                            placeholder="Optional (default deepseek-flash; or deepseek-v4-pro)"
                             type="text"
                           />
                         </label>

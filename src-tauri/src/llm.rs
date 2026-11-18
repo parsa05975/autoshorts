@@ -30,6 +30,15 @@ struct DeepseekResponse {
     choices: Vec<DeepseekChoice>,
 }
 
+/// DeepSeek model to call. `deepseek-chat` and `deepseek-reasoner` were retired on
+/// 2026-07-24, so those (and an empty setting) map to the current `deepseek-flash`.
+fn deepseek_model(requested: Option<String>) -> String {
+    match requested.as_deref().map(str::trim) {
+        None | Some("") | Some("deepseek-chat") | Some("deepseek-reasoner") => "deepseek-flash".to_string(),
+        Some(name) => name.to_string(),
+    }
+}
+
 async fn ask_deepseek(
     prompt: &MomentPrompt,
     api_key: &str,
@@ -37,12 +46,11 @@ async fn ask_deepseek(
 ) -> Result<String> {
     let prompt = prompt.combined();
 
-    let default_model = "deepseek-chat".to_string();
-    let model = model_name
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| m.trim().to_string())
-        .or_else(|| std::env::var("DEEPSEEK_MODEL").ok().filter(|m| !m.trim().is_empty()))
-        .unwrap_or(default_model);
+    let model = deepseek_model(
+        model_name
+            .map(str::to_string)
+            .or_else(|| std::env::var("DEEPSEEK_MODEL").ok()),
+    );
 
     let response = reqwest::Client::new()
         .post("https://api.deepseek.com/chat/completions")
@@ -56,6 +64,11 @@ async fn ask_deepseek(
                 }
             ],
             "temperature": 0.2,
+            // Picking clips doesn't need step-by-step reasoning; thinking mode would
+            // only make each part slower and several times more expensive.
+            "thinking": {
+                "type": "disabled"
+            },
             "response_format": {
                 "type": "json_object"
             }
@@ -1010,6 +1023,14 @@ mod tests {
         let hooks: Vec<&str> = ranked.iter().map(|c| c.hook.as_str()).collect();
         assert_eq!(hooks, ["chase", "quiet"]);
         assert!((ranked[0].score - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn retired_deepseek_names_map_to_the_current_model() {
+        assert_eq!(deepseek_model(None), "deepseek-flash");
+        assert_eq!(deepseek_model(Some("  ".into())), "deepseek-flash");
+        assert_eq!(deepseek_model(Some("deepseek-chat".into())), "deepseek-flash");
+        assert_eq!(deepseek_model(Some("deepseek-v4-pro".into())), "deepseek-v4-pro");
     }
 
     #[test]
