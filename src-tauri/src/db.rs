@@ -377,7 +377,9 @@ impl Database {
              SET status = ?1,
                  output_path = COALESCE(?2, output_path),
                  caption_ass_path = COALESCE(?3, caption_ass_path),
-                 render_log = COALESCE(?4, render_log)
+                 -- Starting a new cut clears the previous attempt's note, so an old
+                 -- error doesn't stay on screen after a successful re-cut.
+                 render_log = CASE WHEN ?1 = 'cutting' THEN NULL ELSE COALESCE(?4, render_log) END
              WHERE candidate_id = ?5",
             params![status, output_path, caption_ass_path, render_log, candidate_id],
         )?;
@@ -504,4 +506,31 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
         rank: row.get(7)?,
         selected: selected == 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_successful_recut_clears_the_previous_error() {
+        let dir = std::env::temp_dir().join(format!("autoshorts-db-{}", Uuid::new_v4()));
+        let db = Database::open(&dir.join("test.sqlite")).unwrap();
+        let project = db.create_project("C:/vod.mp4", "cloud", "tiktok", Some(3600.0)).unwrap();
+        let draft = CandidateDraft { start: 10.0, end: 40.0, score: 0.9, hook: "x".into(), rationale: "y".into() };
+        let candidate = db.replace_candidates(&project.id, &[draft]).unwrap().remove(0);
+        let log_of = |db: &Database| db.project_detail(&project.id).unwrap().clips[0].render_log.clone();
+
+        // First cut: captions failed, so a warning was saved.
+        db.update_clip_for_candidate(&candidate.id, "cutting", None, None, None).unwrap();
+        db.update_clip_for_candidate(&candidate.id, "done", Some("a.mp4"), None, Some("captions were skipped"))
+            .unwrap();
+        assert_eq!(log_of(&db).as_deref(), Some("captions were skipped"));
+
+        // Re-cut succeeds with no warning: the old note must not linger.
+        db.update_clip_for_candidate(&candidate.id, "cutting", None, None, None).unwrap();
+        db.update_clip_for_candidate(&candidate.id, "done", Some("a.mp4"), None, None).unwrap();
+        assert_eq!(log_of(&db), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
