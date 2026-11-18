@@ -124,17 +124,14 @@ pub fn render_flat_clip(
     let probe = probe_media(source_path).ok();
     let has_video = probe.as_ref().map(|p| p.has_video).unwrap_or(false);
 
-    let mut cmd = Command::new("ffmpeg");
-    // Only real errors on stderr, so a failure message shows the cause, not FFmpeg's banner.
-    cmd.args(["-hide_banner", "-loglevel", "error"]);
-    cmd.args(["-y", "-ss", &start, "-i", source_path, "-t", &duration]);
-
     let streamer_facecam = match layout {
         ClipLayout::Streamer { facecam } if has_video => Some(*facecam),
         _ => None,
     };
 
-    if let Some(facecam) = streamer_facecam {
+    // The video filter graph. Captions add one filter per word, so it is written to a
+    // file instead of the command line: Windows caps a command line at ~32,000 chars.
+    let graph = if let Some(facecam) = streamer_facecam {
         let (src_w, src_h) = match probe.as_ref().and_then(|p| p.width.zip(p.height)) {
             Some((w, h)) if w > 0 && h > 0 => (w, h),
             _ => {
@@ -143,26 +140,46 @@ pub fn render_flat_clip(
                 ))
             }
         };
-        let graph = streamer_filter_graph(src_w, src_h, &facecam, drawtext_filters);
-        cmd.args(["-filter_complex", &graph, "-map", "[v]", "-map", "0:a?"]);
-        cmd.args(["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]);
+        Some(streamer_filter_graph(src_w, src_h, &facecam, drawtext_filters))
     } else if has_video {
         let mut filter = "crop=w='2*trunc(min(iw,ih*9/16)/2)':h='2*trunc(min(ih,iw*16/9)/2)'".to_string();
-        if let Some(drawtext) = drawtext_filters {
-            if !drawtext.is_empty() {
-                filter = format!("{},{}", filter, drawtext);
-            }
+        if let Some(drawtext) = drawtext_filters.filter(|d| !d.is_empty()) {
+            filter = format!("{filter},{drawtext}");
         }
-        cmd.args(["-vf", &filter]);
-        cmd.args(["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]);
+        Some(format!("[0:v]{filter}[v]"))
     } else {
-        cmd.arg("-vn");
+        None
+    };
+
+    let graph_file = output_path.with_extension("filtergraph.txt");
+    if let Some(graph) = &graph {
+        std::fs::write(&graph_file, graph).context("writing ffmpeg filter graph")?;
     }
 
-    cmd.args(["-c:a", "aac", "-b:a", "192k"]);
-    cmd.arg(output_path);
+    let run = |graph_option: &str| -> Result<std::process::Output> {
+        let mut cmd = Command::new("ffmpeg");
+        // Only real errors on stderr, so a failure message shows the cause, not FFmpeg's banner.
+        cmd.args(["-hide_banner", "-loglevel", "error"]);
+        cmd.args(["-y", "-ss", &start, "-i", source_path, "-t", &duration]);
+        if graph.is_some() {
+            cmd.arg(graph_option).arg(&graph_file);
+            cmd.args(["-map", "[v]", "-map", "0:a?"]);
+            cmd.args(["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]);
+        } else {
+            cmd.arg("-vn");
+        }
+        cmd.args(["-c:a", "aac", "-b:a", "192k"]);
+        cmd.arg(output_path);
+        cmd.output().context("running ffmpeg clip render")
+    };
 
-    let output = cmd.output().context("running ffmpeg clip render")?;
+    // FFmpeg 7+ reads an option's value from a file with "-/option"; older versions only
+    // know -filter_complex_script (which newer ones drop). Try the new form, then the old.
+    let mut output = run("-/filter_complex")?;
+    if !output.status.success() && String::from_utf8_lossy(&output.stderr).contains("Unrecognized option") {
+        output = run("-filter_complex_script")?;
+    }
+    let _ = std::fs::remove_file(&graph_file);
 
     if !output.status.success() {
         return Err(anyhow!(

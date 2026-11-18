@@ -1175,9 +1175,7 @@ fn watermark_text(raw: &str) -> String {
 /// Drawtext filters for the watermark and the "AD" label. Positions stay clear of
 /// TikTok/Reels/Shorts UI: the top bar, the bottom caption area and the right-side buttons.
 fn build_branding_filters(branding: &ClipBranding, frame_width: i64, clip_len: f64) -> String {
-    let font_option = caption_font_path()
-        .map(|path| format!("fontfile='{}':", path.replace('\\', "/").replace('\'', "'\\''")))
-        .unwrap_or_default();
+    let font_option = caption_font_path().map(|path| font_option_for(&path)).unwrap_or_default();
     let width = frame_width.max(100) as f64;
     let size = (width * 0.042).round().max(12.0);
     let margin_x = format!("{:.0}", width * 0.05);
@@ -1209,6 +1207,17 @@ fn build_branding_filters(branding: &ClipBranding, frame_width: i64, clip_len: f
         ));
     }
     filters.join(",")
+}
+
+/// `fontfile='…':` for a drawtext filter. FFmpeg strips the quotes before splitting
+/// options on ':', so the colon in a Windows path ("C:/Windows/…") must be escaped or
+/// FFmpeg 9 reads it as two broken options.
+fn font_option_for(path: &str) -> String {
+    let escaped = path
+        .replace('\\', "/")
+        .replace(':', "\\:")
+        .replace('\'', "'\\''");
+    format!("fontfile='{escaped}':")
 }
 
 /// Heaviest font available for captions. Black/Impact-style weights read best on phones.
@@ -1280,6 +1289,8 @@ fn caption_text(word: &str) -> String {
 
 /// Caption size as a share of the frame width, before fitting long words.
 const CAPTION_SIZE_RATIO: f64 = 0.15;
+/// Words within this many seconds of a spike's loudest second are highlighted.
+const CAPTION_LOUD_WINDOW_SECS: f64 = 1.0;
 /// Loud words are drawn this much bigger.
 const CAPTION_LOUD_SCALE: f64 = 1.15;
 /// Pop-in: a word starts at this fraction of its size and grows to full size...
@@ -1308,9 +1319,7 @@ fn build_drawtext_filters(
         return String::new();
     }
 
-    let font_option = caption_font_path()
-        .map(|path| format!("fontfile='{}':", path.replace('\\', "/").replace('\'', "'\\''")))
-        .unwrap_or_default();
+    let font_option = caption_font_path().map(|path| font_option_for(&path)).unwrap_or_default();
     let look = caption_look(caption_style);
     let width = frame_width.max(100) as f64;
 
@@ -1330,9 +1339,11 @@ fn build_drawtext_filters(
             continue;
         }
 
+        // Highlight only the words right at a spike's loudest second, so a long laugh
+        // doesn't turn the whole clip yellow.
         let mid = (word.start + word.end) / 2.0;
         let loud = word.text.trim_end().ends_with('!')
-            || spikes.iter().any(|s| mid >= s.start && mid <= s.end);
+            || spikes.iter().any(|s| (mid - (s.peak_sec + 0.5)).abs() <= CAPTION_LOUD_WINDOW_SECS);
 
         // Big, but long words shrink to fit the width (heavy fonts run ~0.75 em per capital).
         let chars = text.chars().count().max(1) as f64;
@@ -1416,6 +1427,63 @@ mod tests {
     fn watermark_text_cannot_break_the_filter() {
         assert_eq!(watermark_text("  @full'heat:clips%{x}\\ "), "@full’heatclipsx");
         assert!(build_branding_filters(&ClipBranding::default(), 1080, 30.0).is_empty());
+    }
+
+    #[test]
+    fn windows_font_paths_have_their_colon_escaped() {
+        assert_eq!(font_option_for("C:\\WINDOWS\\Fonts\\seguibl.ttf"), "fontfile='C\\:/WINDOWS/Fonts/seguibl.ttf':");
+    }
+
+    #[test]
+    fn only_words_near_a_spike_peak_are_highlighted() {
+        // One long laugh from 0 to 30 s, loudest at 20 s.
+        let spikes = [LoudnessSpike { start: 0.0, end: 30.0, peak_sec: 20.0, peak_db: -8.0, excess_db: 15.0 }];
+        let words = vec![w("calm", 5.0, 5.3), w("BRO", 20.2, 20.6)];
+        let out = build_drawtext_filters(&words, 0.0, 30.0, 1080, "tiktok", &spikes);
+        let parts: Vec<&str> = out.split(",drawtext=").collect();
+        assert!(parts[0].contains("fontcolor=white"), "{}", parts[0]);
+        assert!(parts[1].contains("fontcolor=0xFFE11A"), "{}", parts[1]);
+    }
+
+    #[test]
+    fn long_captioned_clip_renders_with_a_colon_in_the_font_path() {
+        if !media::command_exists("ffmpeg") {
+            return;
+        }
+        let font = std::path::Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf");
+        if !font.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("autoshorts-render-{}", std::process::id()));
+        let font_dir = dir.join("C:").join("Fonts");
+        std::fs::create_dir_all(&font_dir).unwrap();
+        let font_copy = font_dir.join("seguibl.ttf");
+        std::fs::copy(font, &font_copy).unwrap();
+        let src = dir.join("src.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=60"])
+            .args(["-f", "lavfi", "-i", "sine=duration=60", "-shortest", "-c:v", "libx264", "-preset", "ultrafast"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+
+        // 60 s of fast speech: ~200 words, a filter graph far beyond Windows' 32k-char command line.
+        let words: Vec<TranscriptWord> = (0..200).map(|i| w("WORD", i as f64 * 0.3, i as f64 * 0.3 + 0.25)).collect();
+        let fo = font_option_for(font_copy.to_str().unwrap());
+        let captions = build_drawtext_filters(&words, 0.0, 60.0, 1080, "tiktok", &[])
+            .replace(&caption_font_path().map(|p| font_option_for(&p)).unwrap_or_default(), &fo);
+        assert!(captions.len() > 40_000, "graph only {} chars", captions.len());
+        assert!(captions.contains("C\\:/Fonts"));
+        let out = dir.join("clip.mp4");
+        let layout = ClipLayout::Streamer { facecam: crate::models::NormRect { x: 0.75, y: 0.7, w: 0.25, h: 0.3 } };
+        let result = media::render_flat_clip(src.to_str().unwrap(), 0.0, 60.0, &out, Some(&captions), &layout);
+        let rendered = out.exists();
+        let leftover = out.with_extension("filtergraph.txt").exists();
+        std::fs::remove_dir_all(&dir).ok();
+        result.unwrap();
+        assert!(rendered && !leftover);
     }
 
     #[test]
