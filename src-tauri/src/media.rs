@@ -125,6 +125,8 @@ pub fn render_flat_clip(
     let has_video = probe.as_ref().map(|p| p.has_video).unwrap_or(false);
 
     let mut cmd = Command::new("ffmpeg");
+    // Only real errors on stderr, so a failure message shows the cause, not FFmpeg's banner.
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
     cmd.args(["-y", "-ss", &start, "-i", source_path, "-t", &duration]);
 
     let streamer_facecam = match layout {
