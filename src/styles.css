@@ -2120,3 +2120,28 @@ button:disabled {
   font-size: 11.5px;
   color: var(--text-muted);
 }
+
+.youtube-link-info {
+  margin: 0 0 1rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+
+.youtube-download {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.youtube-download small {
+  color: var(--text-muted);
+}
+
+.youtube-download .pipeline-progress-bar {
+  flex: none;
+  width: 100%;
+  max-width: none;
+  margin-left: 0;
+}

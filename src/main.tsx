@@ -96,6 +96,49 @@ type PipelineProgress = {
   total: number;
 };
 
+type LinkInfo = {
+  license: string | null;
+  isSafe: boolean;
+  title: string | null;
+  durationSec: number | null;
+};
+
+type YoutubeProgress = {
+  part: "video" | "audio" | "file";
+  downloadedBytes: number | null;
+  totalBytes: number | null;
+  speedBytesPerSec: number | null;
+  etaSec: number | null;
+};
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${Math.round(bytes / 1e6)} MB`;
+  return `${Math.round(bytes / 1e3)} KB`;
+}
+
+function formatDuration(totalSec: number) {
+  const sec = Math.max(0, Math.round(totalSec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m} min`;
+  return `${sec} sec`;
+}
+
+function describeYoutubeProgress(p: YoutubeProgress) {
+  const what = p.part === "audio" ? "Downloading audio" : p.part === "video" ? "Downloading video" : "Downloading";
+  const parts = [what];
+  if (p.downloadedBytes != null && p.totalBytes) {
+    parts.push(`${formatBytes(p.downloadedBytes)} of ${formatBytes(p.totalBytes)}`);
+  } else if (p.downloadedBytes != null) {
+    parts.push(formatBytes(p.downloadedBytes));
+  }
+  if (p.speedBytesPerSec != null) parts.push(`${formatBytes(p.speedBytesPerSec)}/s`);
+  if (p.etaSec != null) parts.push(`about ${formatDuration(p.etaSec)} left`);
+  return parts.join(" · ");
+}
+
 type ClipCopy = {
   id: string;
   clipId: string;
@@ -245,6 +288,8 @@ function App() {
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "downloading">("idle");
   const [youtubeWarningLicense, setYoutubeWarningLicense] = useState<string | null>(null);
+  const [youtubeInfo, setYoutubeInfo] = useState<LinkInfo | null>(null);
+  const [youtubeProgress, setYoutubeProgress] = useState<YoutubeProgress | null>(null);
 
   // Persistence logic from localStorage
   const [isOnboarded, setIsOnboarded] = useState<boolean | null>(null);
@@ -355,6 +400,21 @@ function App() {
   useEffect(() => {
     if (busy === "idle") setProgress(null);
   }, [busy]);
+
+  useEffect(() => {
+    let stop: (() => void) | null = null;
+    let cancelled = false;
+    void listen<YoutubeProgress>("youtube-download-progress", (event) => setYoutubeProgress(event.payload)).then(
+      (unlisten) => {
+        if (cancelled) unlisten();
+        else stop = unlisten;
+      },
+    );
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -491,8 +551,10 @@ function App() {
     if (!youtubeUrl) return;
     setYoutubeStatus("checking");
     setError(null);
+    setYoutubeInfo(null);
     try {
-      const result = await invoke<{isSafe: boolean; license: string | null}>("check_youtube_copyright", { url: youtubeUrl });
+      const result = await invoke<LinkInfo>("check_youtube_copyright", { url: youtubeUrl });
+      setYoutubeInfo(result);
       if (!result.isSafe) {
         setYoutubeWarningLicense(result.license || "Unknown / Not specified");
         setYoutubeStatus("warning");
@@ -507,18 +569,27 @@ function App() {
 
   async function executeYoutubeDownload() {
     setYoutubeStatus("downloading");
+    setYoutubeProgress(null);
     setError(null);
     try {
       const downloadedPath = await invoke<string>("download_youtube_video", { url: youtubeUrl });
       setYoutubeModalOpen(false);
       setYoutubeUrl("");
+      setYoutubeInfo(null);
       setYoutubeStatus("idle");
       setMediaPathToImport(downloadedPath);
       setShowStyleModal(true);
     } catch (err: any) {
-      setError(err.toString());
+      const message = err.toString();
+      if (!message.includes("Download cancelled")) setError(message);
       setYoutubeStatus("idle");
+    } finally {
+      setYoutubeProgress(null);
     }
+  }
+
+  async function cancelYoutubeDownload() {
+    await invoke<boolean>("cancel_youtube_download");
   }
 
   async function confirmImport(style: string) {
@@ -1533,6 +1604,30 @@ function App() {
                 style={{ width: "100%", padding: "0.75rem", borderRadius: "8px", border: "1px solid var(--border)", background: "var(--background)", color: "var(--foreground)", fontSize: "1rem", marginBottom: "1rem" }}
               />
 
+              {youtubeInfo && (youtubeInfo.title || youtubeInfo.durationSec) && (
+                <p className="youtube-link-info">
+                  {youtubeInfo.title}
+                  {youtubeInfo.durationSec ? ` · ${formatDuration(youtubeInfo.durationSec)}` : ""}
+                </p>
+              )}
+
+              {youtubeStatus === "downloading" && (
+                <div className="youtube-download" role="status">
+                  <span>{youtubeProgress ? describeYoutubeProgress(youtubeProgress) : "Starting download..."}</span>
+                  <div className="pipeline-progress-bar">
+                    <div
+                      style={{
+                        width:
+                          youtubeProgress?.downloadedBytes != null && youtubeProgress.totalBytes
+                            ? `${Math.min(100, (youtubeProgress.downloadedBytes / youtubeProgress.totalBytes) * 100)}%`
+                            : "0%",
+                      }}
+                    />
+                  </div>
+                  <small>Long streams are big files. If you cancel, the next try picks up where it stopped.</small>
+                </div>
+              )}
+
               {youtubeStatus === "warning" && (
                 <div style={{ background: "rgba(255, 165, 0, 0.1)", border: "1px solid orange", padding: "1rem", borderRadius: "8px", marginBottom: "1rem", color: "orange" }}>
                   <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginBottom: "0.5rem", fontWeight: "bold" }}>
@@ -1548,12 +1643,21 @@ function App() {
               )}
 
               <div className="style-modal-actions" style={{ marginTop: "1rem" }}>
-                <button 
-                  className="btn-cancel" 
-                  onClick={() => { setYoutubeModalOpen(false); setYoutubeUrl(""); setYoutubeStatus("idle"); }}
-                  disabled={youtubeStatus === "checking" || youtubeStatus === "downloading"}
+                <button
+                  className="btn-cancel"
+                  onClick={() => {
+                    if (youtubeStatus === "downloading") {
+                      void cancelYoutubeDownload();
+                      return;
+                    }
+                    setYoutubeModalOpen(false);
+                    setYoutubeUrl("");
+                    setYoutubeInfo(null);
+                    setYoutubeStatus("idle");
+                  }}
+                  disabled={youtubeStatus === "checking"}
                 >
-                  Cancel
+                  {youtubeStatus === "downloading" ? "Cancel download" : "Cancel"}
                 </button>
                 {youtubeStatus === "warning" ? (
                   <button className="btn-confirm" onClick={executeYoutubeDownload}>
